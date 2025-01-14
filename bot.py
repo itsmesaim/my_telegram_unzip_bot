@@ -2,21 +2,26 @@ import os
 import zipfile
 import logging
 import mimetypes
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from telethon import TelegramClient
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.tl.types import DocumentAttributeFilename
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
-# Telegram Bot Token and API credentials
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+# Telegram API credentials
 API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
+BOT_TOKEN = os.getenv('BOT_TOKEN')
 
-# Initialize Telethon Client (for faster uploads)
-client = TelegramClient('bot_session', API_ID, API_HASH)
+# Use StringSession for session management
+SESSION_STRING = os.getenv('SESSION_STRING')  # Save this in .env for persistence
+if not SESSION_STRING:
+    SESSION_STRING = None  # First-time setup
+
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 # Initialize logging
 logging.basicConfig(
@@ -24,125 +29,138 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("BotLogger")
 
-# Command: /start
-async def start(update: Update, context: CallbackContext):
+# Constants
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB limit for Telethon
+start_time = datetime.now()
+
+# Function to handle /start command
+async def start_command(event):
+    await event.respond("Welcome! Send me a ZIP file, and I will upload all files using Telethon.")
     logger.info("User started the bot.")
-    await update.message.reply_text("Welcome! Send me a ZIP file, and I will upload photos, videos, and unknown files as documents.")
 
-# Command: /help
-async def help_command(update: Update, context: CallbackContext):
+# Function to handle /help command
+async def help_command(event):
+    await event.respond("Send me a ZIP file, and I will process its contents. Images and videos will be sent accordingly, and other files will be sent as documents.")
     logger.info("User requested help.")
-    await update.message.reply_text("Send me a ZIP file with photos, videos, and I will upload files accordingly. Unknown files will be uploaded as documents.")
 
-# Report progress to the user based on log contents
-async def report_progress(update: Update):
-    log_file = 'logs/bot.log'
-    if os.path.exists(log_file):
-        with open(log_file, 'r') as file:
-            lines = file.readlines()
-            recent_logs = '\n'.join(lines[-10:])  # Fetch last 10 log lines for brevity
-            await update.message.reply_text(f"Recent Progress Logs:\n\n{recent_logs}")
-    else:
-        await update.message.reply_text("No logs found. Processing might not have started yet.")
+# Function to handle /uptime command
+async def uptime_command(event):
+    uptime = datetime.now() - start_time
+    uptime_str = str(timedelta(seconds=uptime.total_seconds()))
+    await event.respond(f"Bot Uptime: {uptime_str}")
+    logger.info("User requested uptime.")
 
-# Handle ZIP file upload
-async def handle_zip(update: Update, context: CallbackContext):
-    logger.info("Received a ZIP file.")
+# Function to process ZIP files
+async def handle_zip(event):
     try:
-        # Ensure it's a ZIP file
-        if update.message.document and update.message.document.mime_type == 'application/zip':
-            file = await update.message.document.get_file()
-            file_name = update.message.document.file_name
+        if event.message.file and event.message.file.name.endswith('.zip'):
+            file_name = event.message.file.name
+            file_size = event.message.file.size
 
-            logger.info(f"Processing ZIP file: {file_name}")
-
-            # Create directory to store the zip file and its contents
-            if not os.path.exists('downloads'):
-                os.makedirs('downloads')
+            # Check the file size before proceeding
+            if file_size > MAX_FILE_SIZE:
+                await event.respond(f"File '{file_name}' is too large (exceeds 2 GB). Please upload a smaller file.")
+                logger.warning(f"File '{file_name}' is too large. Skipping processing.")
+                return
 
             zip_path = os.path.join('downloads', file_name)
+            os.makedirs('downloads', exist_ok=True)
 
-            # Download ZIP file
+            # Notify user about downloading
+            await event.respond(f"Downloading ZIP file: {file_name}...")
             logger.info(f"Downloading ZIP file: {file_name}")
-            await file.download_to_drive(zip_path)
 
-            # Notify the user that the download is complete
-            await update.message.reply_text(f"Downloaded ZIP file: {file_name}. Starting to process...")
+            # Download the ZIP file
+            await event.download_media(file=zip_path)
+            await event.respond(f"Downloaded ZIP file: {file_name}. Starting extraction...")
 
             # Unzip the file
             unzip_dir = os.path.join('downloads', file_name.replace('.zip', ''))
             os.makedirs(unzip_dir, exist_ok=True)
 
-            logger.info(f"Unzipping file: {file_name}")
+            logger.info(f"Extracting file: {file_name}")
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(unzip_dir)
+            await event.respond(f"Extraction complete. Preparing to upload files...")
 
-            # Classify and upload each file
+            # Process each file
             for root, dirs, files in os.walk(unzip_dir):
                 for filename in files:
                     file_path = os.path.join(root, filename)
                     mime_type, _ = mimetypes.guess_type(file_path)
 
+                    # Check if the extracted file size exceeds 2 GB
+                    if os.path.getsize(file_path) > MAX_FILE_SIZE:
+                        logger.warning(f"File '{filename}' is too large (exceeds 2 GB). Skipping.")
+                        await event.respond(f"Skipping '{filename}': File size exceeds 2 GB.")
+                        continue
+
                     if mime_type:
                         logger.info(f"Processing file: {filename} | MIME type: {mime_type}")
                         if mime_type.startswith('image/'):
-                            await send_photo_or_video(update, file_path, is_image=True)
+                            await send_photo_or_video(event, file_path, is_image=True)
                         elif mime_type.startswith('video/'):
-                            await send_photo_or_video(update, file_path, is_image=False)
+                            await send_photo_or_video(event, file_path, is_image=False)
                         else:
-                            # Upload unknown formats as documents
-                            await send_document(file_path, update)
+                            await send_document(event, file_path)
                     else:
-                        # Upload unknown formats as documents
                         logger.info(f"Unknown file format for: {filename}. Uploading as document.")
-                        await send_document(file_path, update)
+                        await send_document(event, file_path)
 
-            # Clean up: Delete downloaded and extracted files
             cleanup(unzip_dir, zip_path)
             logger.info(f"Cleaned up files for: {file_name}")
-            await update.message.reply_text(f"Successfully uploaded files from {file_name}")
+            await event.respond(f"All files from {file_name} have been uploaded successfully.")
 
-            # Send final log report to the user
-            await report_progress(update)
         else:
             logger.error("Received file is not a ZIP file.")
-            await update.message.reply_text("Please upload a valid ZIP file.")
+            await event.respond("Please upload a valid ZIP file.")
     except Exception as e:
         logger.error(f"Error processing ZIP file: {e}")
-        await update.message.reply_text(f"An error occurred: {e}")
+        await event.respond(f"An unexpected error occurred. Please try again later.")
 
-# Function to upload photo or video using Telethon
-async def send_photo_or_video(update: Update, file_path: str, is_image: bool):
+# Function to send photos or videos
+async def send_photo_or_video(event, file_path: str, is_image: bool):
     try:
-        # Use Telethon for faster upload
-        chat_id = update.message.chat_id
-        if is_image:
-            logger.info(f"Uploading photo: {os.path.basename(file_path)}")
-        else:
-            logger.info(f"Uploading video: {os.path.basename(file_path)}")
+        file_name = os.path.basename(file_path)
 
-        # Send file using Telethon
-        await client.send_file(chat_id, file_path)
+        if is_image:
+            logger.info(f"Uploading photo: {file_name}")
+            await event.respond(f"Uploading photo: {file_name}...")
+        else:
+            logger.info(f"Uploading video: {file_name}")
+            await event.respond(f"Uploading video: {file_name}...")
+
+        await client.send_file(
+            event.chat_id,
+            file_path,
+            caption=f"Uploading {'photo' if is_image else 'video'}: {file_name}",
+            attributes=[DocumentAttributeFilename(file_name)]
+        )
     except Exception as e:
         logger.error(f"Error uploading {'photo' if is_image else 'video'} {file_path}: {e}")
+        await event.respond(f"Failed to upload {'photo' if is_image else 'video'}: {file_name}.")
 
-# Function to upload unknown files as documents
-async def send_document(file_path: str, update: Update):
+# Function to send documents
+async def send_document(event, file_path: str):
     try:
-        chat_id = update.message.chat_id
-        logger.info(f"Uploading unknown format file as document: {os.path.basename(file_path)}")
+        file_name = os.path.basename(file_path)
+        logger.info(f"Uploading document: {file_name}")
+        await event.respond(f"Uploading document: {file_name}...")
 
-        # Send document using Telethon
-        await client.send_file(chat_id, file_path)
+        await client.send_file(
+            event.chat_id,
+            file_path,
+            caption=f"Uploading document: {file_name}"
+        )
     except Exception as e:
         logger.error(f"Error uploading document {file_path}: {e}")
+        await event.respond(f"Failed to upload document: {file_name}.")
 
 # Cleanup function
 def cleanup(unzip_dir, zip_path):
     try:
-        # Remove all unzipped files and the zip file itself
         os.remove(zip_path)
         for root, dirs, files in os.walk(unzip_dir):
             for file in files:
@@ -151,29 +169,37 @@ def cleanup(unzip_dir, zip_path):
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
 
-# Error handler
-async def error_handler(update: Update, context: CallbackContext):
-    logger.error(f"Update {update} caused error: {context.error}")
+# Main function
+async def main():
+    # Start Telethon client
+    await client.start(bot_token=BOT_TOKEN)
 
-def main():
-    # Initialize bot application
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Save session string if first-time setup
+    if not SESSION_STRING:
+        session_string = StringSession.save(client.session)
+        print("Session string:", session_string)
+        print("Save this session string in your environment variables for future use.")
 
-    # Connect to Telegram API with Telethon (for faster uploads)
-    client.start()
+    # Register command handlers
+    @client.on(events.NewMessage(pattern='/start'))
+    async def start_handler(event):
+        await start_command(event)
 
-    # Commands
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
+    @client.on(events.NewMessage(pattern='/help'))
+    async def help_handler(event):
+        await help_command(event)
 
-    # Handle zip file uploads
-    application.add_handler(MessageHandler(filters.Document.MimeType("application/zip"), handle_zip))
+    @client.on(events.NewMessage(pattern='/uptime'))
+    async def uptime_handler(event):
+        await uptime_command(event)
 
-    # Log all errors
-    application.add_error_handler(error_handler)
+    @client.on(events.NewMessage(incoming=True, func=lambda e: e.message.file and e.message.file.name.endswith('.zip')))
+    async def zip_handler(event):
+        await handle_zip(event)
 
-    # Start the bot
-    application.run_polling()
+    logger.info("Bot is running...")
+    await client.run_until_disconnected()
 
 if __name__ == '__main__':
-    main()
+    import asyncio
+    asyncio.run(main())

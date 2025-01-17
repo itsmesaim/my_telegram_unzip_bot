@@ -8,7 +8,10 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import DocumentAttributeFilename
+from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
+import subprocess
+import json
+import asyncio
 
 # Load environment variables
 load_dotenv()
@@ -51,7 +54,26 @@ async def uptime_command(event):
     await event.respond(f"Bot Uptime: {uptime_str}")
     logger.info("User requested uptime.")
 
-# Process ZIP files
+# Extract video metadata using ffmpeg
+def get_video_metadata(file_path):
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+            'stream=width,height,duration', '-of', 'json', file_path
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        metadata = json.loads(result.stdout)
+        stream = metadata.get('streams', [{}])[0]
+        return {
+            'width': int(stream.get('width', 0)),
+            'height': int(stream.get('height', 0)),
+            'duration': int(float(stream.get('duration', 0)))
+        }
+    except Exception as e:
+        logger.error(f"Failed to extract metadata for {file_path}: {e}")
+        return {'width': 0, 'height': 0, 'duration': 0}
+
+# Process ZIP files with optimized video uploads
 async def handle_zip(event):
     try:
         message_file = event.message.file
@@ -80,14 +102,17 @@ async def handle_zip(event):
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(unzip_dir)
 
+        # Use asyncio for concurrent uploads
+        upload_tasks = []
         for root, _, files in os.walk(unzip_dir):
             for filename in files:
                 file_path = os.path.join(root, filename)
                 if os.path.getsize(file_path) > MAX_FILE_SIZE:
                     await event.respond(f"Skipping '{filename}': File size exceeds 2 GB.")
                     continue
-                mime_type, _ = mimetypes.guess_type(file_path)
-                await send_file(event, file_path, mime_type)
+                upload_tasks.append(upload_file(event, file_path))
+
+        await asyncio.gather(*upload_tasks)
 
         cleanup(unzip_dir, zip_path)
         await event.respond(f"All files from {file_name} have been uploaded successfully.")
@@ -96,15 +121,49 @@ async def handle_zip(event):
         logger.exception(f"Error processing ZIP file: {e}")
         await event.respond(f"An error occurred: {e}")
 
-async def send_file(event, file_path, mime_type):
+async def upload_file(event, file_path):
     try:
         file_name = os.path.basename(file_path)
-        if mime_type and mime_type.startswith(('image/', 'video/')):
-            await client.send_file(event.chat_id, file_path, caption=f"File: {file_name}")
+        mime_type, _ = mimetypes.guess_type(file_path)
+        is_video = mime_type and mime_type.startswith('video/')
+
+        if is_video:
+            # Get video metadata
+            metadata = get_video_metadata(file_path)
+            width, height, duration = metadata['width'], metadata['height'], metadata['duration']
+
+            # Ensure valid metadata for upload
+            if width == 0 or height == 0:
+                await event.respond(f"Skipping {file_name}: Unable to fetch video metadata.")
+                return
+
+            attributes = [
+                DocumentAttributeVideo(
+                    supports_streaming=True,
+                    w=width,
+                    h=height,
+                    duration=duration
+                )
+            ]
+            await client.send_file(
+                event.chat_id,
+                file_path,
+                caption=f"Uploading video: {file_name}",
+                attributes=attributes
+            )
         else:
-            await client.send_file(event.chat_id, file_path, attributes=[DocumentAttributeFilename(file_name)])
+            await client.send_file(
+                event.chat_id,
+                file_path,
+                attributes=[DocumentAttributeFilename(file_name)],
+                caption=f"Uploading file: {file_name}"
+            )
+
+        logger.info(f"Uploaded: {file_name}")
+
     except Exception as e:
-        logger.exception(f"Failed to send {file_path}: {e}")
+        logger.exception(f"Failed to upload {file_path}: {e}")
+        await event.respond(f"Failed to upload {file_name}: {e}")
 
 def cleanup(unzip_dir, zip_path):
     try:

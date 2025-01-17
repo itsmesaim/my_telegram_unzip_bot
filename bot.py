@@ -21,9 +21,15 @@ API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 
-# Use StringSession for session management
-SESSION_STRING = os.getenv('SESSION_STRING')
-client = TelegramClient(StringSession(SESSION_STRING or ""), API_ID, API_HASH)
+# Load session string from file if available
+SESSION_FILE = 'session_save.txt'
+if os.path.exists(SESSION_FILE):
+    with open(SESSION_FILE, 'r') as file:
+        SESSION_STRING = file.read().strip()
+else:
+    SESSION_STRING = ""
+
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 # Initialize logging
 logging.basicConfig(
@@ -38,16 +44,19 @@ MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB limit for Telethon
 start_time = datetime.now()
 
 # Function to handle /start command
+@client.on(events.NewMessage(pattern='/start'))
 async def start_command(event):
     await event.respond("Welcome! Send me a ZIP file, and I will upload all files using Telethon.")
     logger.info("User started the bot.")
 
 # Function to handle /help command
+@client.on(events.NewMessage(pattern='/help'))
 async def help_command(event):
     await event.respond("Send me a ZIP file, and I will process its contents.")
     logger.info("User requested help.")
 
 # Function to handle /uptime command
+@client.on(events.NewMessage(pattern='/uptime'))
 async def uptime_command(event):
     uptime = datetime.now() - start_time
     uptime_str = str(timedelta(seconds=uptime.total_seconds()))
@@ -73,7 +82,21 @@ def get_video_metadata(file_path):
         logger.error(f"Failed to extract metadata for {file_path}: {e}")
         return {'width': 0, 'height': 0, 'duration': 0}
 
-# Process ZIP files with optimized video uploads
+# Add silent audio track to video
+def add_silent_audio(file_path):
+    try:
+        temp_path = f"{file_path}_temp.mp4"
+        cmd = [
+            'ffmpeg', '-i', file_path, '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+            '-shortest', '-c:v', 'copy', '-c:a', 'aac', temp_path
+        ]
+        subprocess.run(cmd, check=True)
+        os.replace(temp_path, file_path)
+    except Exception as e:
+        logger.error(f"Failed to add silent audio to {file_path}: {e}")
+
+# Process ZIP files
+@client.on(events.NewMessage(func=lambda e: e.message.file and e.message.file.name.endswith('.zip')))
 async def handle_zip(event):
     try:
         message_file = event.message.file
@@ -92,8 +115,9 @@ async def handle_zip(event):
         os.makedirs('downloads', exist_ok=True)
         zip_path = os.path.join('downloads', file_name)
 
-        await event.respond(f"Downloading ZIP file: {file_name}...")
-        await event.download_media(file=zip_path)
+        progress_msg = await event.respond(f"Downloading ZIP file: {file_name}...")
+        await event.download_media(file=zip_path, progress_callback=lambda d, t: asyncio.create_task(
+            update_progress(progress_msg, d, t, "Downloading...")))
 
         unzip_dir = zip_path.rstrip('.zip')
         os.makedirs(unzip_dir, exist_ok=True)
@@ -128,14 +152,14 @@ async def upload_file(event, file_path):
         is_video = mime_type and mime_type.startswith('video/')
 
         if is_video:
-            # Get video metadata
             metadata = get_video_metadata(file_path)
             width, height, duration = metadata['width'], metadata['height'], metadata['duration']
 
-            # Ensure valid metadata for upload
             if width == 0 or height == 0:
                 await event.respond(f"Skipping {file_name}: Unable to fetch video metadata.")
                 return
+
+            add_silent_audio(file_path)
 
             attributes = [
                 DocumentAttributeVideo(
@@ -145,25 +169,34 @@ async def upload_file(event, file_path):
                     duration=duration
                 )
             ]
+            progress_msg = await event.respond(f"Uploading video: {file_name}...")
             await client.send_file(
                 event.chat_id,
                 file_path,
-                caption=f"Uploading video: {file_name}",
-                attributes=attributes
+                caption=f"Video: {file_name}",
+                attributes=attributes,
+                progress_callback=lambda d, t: asyncio.create_task(
+                    update_progress(progress_msg, d, t, "Uploading..."))
             )
         else:
+            progress_msg = await event.respond(f"Uploading file: {file_name}...")
             await client.send_file(
                 event.chat_id,
                 file_path,
-                attributes=[DocumentAttributeFilename(file_name)],
-                caption=f"Uploading file: {file_name}"
+                caption=f"File: {file_name}",
+                progress_callback=lambda d, t: asyncio.create_task(
+                    update_progress(progress_msg, d, t, "Uploading..."))
             )
-
-        logger.info(f"Uploaded: {file_name}")
-
     except Exception as e:
         logger.exception(f"Failed to upload {file_path}: {e}")
         await event.respond(f"Failed to upload {file_name}: {e}")
+
+async def update_progress(message, downloaded, total, action):
+    try:
+        percent = (downloaded / total) * 100
+        await message.edit(f"{action} {percent:.2f}% complete")
+    except Exception as e:
+        logger.error(f"Failed to update progress: {e}")
 
 def cleanup(unzip_dir, zip_path):
     try:
@@ -176,12 +209,14 @@ def cleanup(unzip_dir, zip_path):
 # Main function
 async def main():
     await client.start(bot_token=BOT_TOKEN)
-    if not SESSION_STRING:
-        print("Session string:", StringSession.save(client.session))
-    client.add_event_handler(start_command, events.NewMessage(pattern='/start'))
-    client.add_event_handler(help_command, events.NewMessage(pattern='/help'))
-    client.add_event_handler(uptime_command, events.NewMessage(pattern='/uptime'))
-    client.add_event_handler(handle_zip, events.NewMessage(func=lambda e: e.message.file and e.message.file.name.endswith('.zip')))
+
+    # Save session string if it's a new session
+    if not os.path.exists(SESSION_FILE):
+        session_string = StringSession.save(client.session)
+        with open(SESSION_FILE, 'w') as session_file:
+            session_file.write(session_string)
+        print("Session string saved to 'session_save.txt'")
+
     logger.info("Bot is running...")
     await client.run_until_disconnected()
 

@@ -1,5 +1,7 @@
+# bot/main.py
 import os
 import zipfile
+import shutil
 import logging
 import mimetypes
 from datetime import datetime, timedelta
@@ -17,11 +19,8 @@ API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 
 # Use StringSession for session management
-SESSION_STRING = os.getenv('SESSION_STRING')  # Save this in .env for persistence
-if not SESSION_STRING:
-    SESSION_STRING = None  # First-time setup
-
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+SESSION_STRING = os.getenv('SESSION_STRING')
+client = TelegramClient(StringSession(SESSION_STRING or ""), API_ID, API_HASH)
 
 # Initialize logging
 logging.basicConfig(
@@ -42,7 +41,7 @@ async def start_command(event):
 
 # Function to handle /help command
 async def help_command(event):
-    await event.respond("Send me a ZIP file, and I will process its contents. Images and videos will be sent accordingly, and other files will be sent as documents.")
+    await event.respond("Send me a ZIP file, and I will process its contents.")
     logger.info("User requested help.")
 
 # Function to handle /uptime command
@@ -52,151 +51,78 @@ async def uptime_command(event):
     await event.respond(f"Bot Uptime: {uptime_str}")
     logger.info("User requested uptime.")
 
-# Function to process ZIP files
+# Process ZIP files
 async def handle_zip(event):
     try:
-        if event.message.file and event.message.file.name.endswith('.zip'):
-            file_name = event.message.file.name
-            file_size = event.message.file.size
-
-            # Check the file size before proceeding
-            if file_size > MAX_FILE_SIZE:
-                await event.respond(f"File '{file_name}' is too large (exceeds 2 GB). Please upload a smaller file.")
-                logger.warning(f"File '{file_name}' is too large. Skipping processing.")
-                return
-
-            zip_path = os.path.join('downloads', file_name)
-            os.makedirs('downloads', exist_ok=True)
-
-            # Notify user about downloading
-            await event.respond(f"Downloading ZIP file: {file_name}...")
-            logger.info(f"Downloading ZIP file: {file_name}")
-
-            # Download the ZIP file
-            await event.download_media(file=zip_path)
-            await event.respond(f"Downloaded ZIP file: {file_name}. Starting extraction...")
-
-            # Unzip the file
-            unzip_dir = os.path.join('downloads', file_name.replace('.zip', ''))
-            os.makedirs(unzip_dir, exist_ok=True)
-
-            logger.info(f"Extracting file: {file_name}")
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(unzip_dir)
-            await event.respond(f"Extraction complete. Preparing to upload files...")
-
-            # Process each file
-            for root, dirs, files in os.walk(unzip_dir):
-                for filename in files:
-                    file_path = os.path.join(root, filename)
-                    mime_type, _ = mimetypes.guess_type(file_path)
-
-                    # Check if the extracted file size exceeds 2 GB
-                    if os.path.getsize(file_path) > MAX_FILE_SIZE:
-                        logger.warning(f"File '{filename}' is too large (exceeds 2 GB). Skipping.")
-                        await event.respond(f"Skipping '{filename}': File size exceeds 2 GB.")
-                        continue
-
-                    if mime_type:
-                        logger.info(f"Processing file: {filename} | MIME type: {mime_type}")
-                        if mime_type.startswith('image/'):
-                            await send_photo_or_video(event, file_path, is_image=True)
-                        elif mime_type.startswith('video/'):
-                            await send_photo_or_video(event, file_path, is_image=False)
-                        else:
-                            await send_document(event, file_path)
-                    else:
-                        logger.info(f"Unknown file format for: {filename}. Uploading as document.")
-                        await send_document(event, file_path)
-
-            cleanup(unzip_dir, zip_path)
-            logger.info(f"Cleaned up files for: {file_name}")
-            await event.respond(f"All files from {file_name} have been uploaded successfully.")
-
-        else:
-            logger.error("Received file is not a ZIP file.")
+        message_file = event.message.file
+        if not (message_file and message_file.name.endswith('.zip')):
             await event.respond("Please upload a valid ZIP file.")
-    except Exception as e:
-        logger.error(f"Error processing ZIP file: {e}")
-        await event.respond(f"An unexpected error occurred. Please try again later.")
+            return
+        
+        file_name = message_file.name
+        file_size = message_file.size
 
-# Function to send photos or videos
-async def send_photo_or_video(event, file_path: str, is_image: bool):
+        # Check size limit
+        if file_size > MAX_FILE_SIZE:
+            await event.respond(f"'{file_name}' is too large (max 2 GB).")
+            return
+
+        os.makedirs('downloads', exist_ok=True)
+        zip_path = os.path.join('downloads', file_name)
+
+        await event.respond(f"Downloading ZIP file: {file_name}...")
+        await event.download_media(file=zip_path)
+
+        unzip_dir = zip_path.rstrip('.zip')
+        os.makedirs(unzip_dir, exist_ok=True)
+
+        # Extract files
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(unzip_dir)
+
+        for root, _, files in os.walk(unzip_dir):
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                if os.path.getsize(file_path) > MAX_FILE_SIZE:
+                    await event.respond(f"Skipping '{filename}': File size exceeds 2 GB.")
+                    continue
+                mime_type, _ = mimetypes.guess_type(file_path)
+                await send_file(event, file_path, mime_type)
+
+        cleanup(unzip_dir, zip_path)
+        await event.respond(f"All files from {file_name} have been uploaded successfully.")
+
+    except Exception as e:
+        logger.exception(f"Error processing ZIP file: {e}")
+        await event.respond(f"An error occurred: {e}")
+
+async def send_file(event, file_path, mime_type):
     try:
         file_name = os.path.basename(file_path)
-
-        if is_image:
-            logger.info(f"Uploading photo: {file_name}")
-            await event.respond(f"Uploading photo: {file_name}...")
+        if mime_type and mime_type.startswith(('image/', 'video/')):
+            await client.send_file(event.chat_id, file_path, caption=f"File: {file_name}")
         else:
-            logger.info(f"Uploading video: {file_name}")
-            await event.respond(f"Uploading video: {file_name}...")
-
-        await client.send_file(
-            event.chat_id,
-            file_path,
-            caption=f"Uploading {'photo' if is_image else 'video'}: {file_name}",
-            attributes=[DocumentAttributeFilename(file_name)]
-        )
+            await client.send_file(event.chat_id, file_path, attributes=[DocumentAttributeFilename(file_name)])
     except Exception as e:
-        logger.error(f"Error uploading {'photo' if is_image else 'video'} {file_path}: {e}")
-        await event.respond(f"Failed to upload {'photo' if is_image else 'video'}: {file_name}.")
+        logger.exception(f"Failed to send {file_path}: {e}")
 
-# Function to send documents
-async def send_document(event, file_path: str):
-    try:
-        file_name = os.path.basename(file_path)
-        logger.info(f"Uploading document: {file_name}")
-        await event.respond(f"Uploading document: {file_name}...")
-
-        await client.send_file(
-            event.chat_id,
-            file_path,
-            caption=f"Uploading document: {file_name}"
-        )
-    except Exception as e:
-        logger.error(f"Error uploading document {file_path}: {e}")
-        await event.respond(f"Failed to upload document: {file_name}.")
-
-# Cleanup function
 def cleanup(unzip_dir, zip_path):
     try:
-        os.remove(zip_path)
-        for root, dirs, files in os.walk(unzip_dir):
-            for file in files:
-                os.remove(os.path.join(root, file))
-        os.rmdir(unzip_dir)
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+        shutil.rmtree(unzip_dir, ignore_errors=True)
     except Exception as e:
-        logger.error(f"Error during cleanup: {e}")
+        logger.exception(f"Cleanup error: {e}")
 
 # Main function
 async def main():
-    # Start Telethon client
     await client.start(bot_token=BOT_TOKEN)
-
-    # Save session string if first-time setup
     if not SESSION_STRING:
-        session_string = StringSession.save(client.session)
-        print("Session string:", session_string)
-        print("Save this session string in your environment variables for future use.")
-
-    # Register command handlers
-    @client.on(events.NewMessage(pattern='/start'))
-    async def start_handler(event):
-        await start_command(event)
-
-    @client.on(events.NewMessage(pattern='/help'))
-    async def help_handler(event):
-        await help_command(event)
-
-    @client.on(events.NewMessage(pattern='/uptime'))
-    async def uptime_handler(event):
-        await uptime_command(event)
-
-    @client.on(events.NewMessage(incoming=True, func=lambda e: e.message.file and e.message.file.name.endswith('.zip')))
-    async def zip_handler(event):
-        await handle_zip(event)
-
+        print("Session string:", StringSession.save(client.session))
+    client.add_event_handler(start_command, events.NewMessage(pattern='/start'))
+    client.add_event_handler(help_command, events.NewMessage(pattern='/help'))
+    client.add_event_handler(uptime_command, events.NewMessage(pattern='/uptime'))
+    client.add_event_handler(handle_zip, events.NewMessage(func=lambda e: e.message.file and e.message.file.name.endswith('.zip')))
     logger.info("Bot is running...")
     await client.run_until_disconnected()
 

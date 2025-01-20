@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeVideo
-from FastTelethonhelper import fast_download, fast_upload  # Import FastTelethon functions
+from FastTelethonhelper import fast_download, fast_upload
 import subprocess
 import json
 import asyncio
@@ -46,19 +46,19 @@ start_time = datetime.now()
 
 @client.on(events.NewMessage(pattern='/start'))
 async def start_command(event):
-    await event.respond("Welcome! Send me a ZIP file, and I will upload all files using Telethon.")
+    await event.respond("👋 **Welcome!**\n\nSend me a ZIP file, and I will upload its contents to this chat.")
     logger.info("User started the bot.")
 
 @client.on(events.NewMessage(pattern='/help'))
 async def help_command(event):
-    await event.respond("Send me a ZIP file, and I will process its contents.")
+    await event.respond("📜 **Help**\n\nSend me a ZIP file, and I will process its contents.\n\n**Commands:**\n/start - Start the bot\n/help - Show this help message\n/uptime - Check bot uptime")
     logger.info("User requested help.")
 
 @client.on(events.NewMessage(pattern='/uptime'))
 async def uptime_command(event):
     uptime = datetime.now() - start_time
     uptime_str = str(timedelta(seconds=uptime.total_seconds()))
-    await event.respond(f"Bot Uptime: {uptime_str}")
+    await event.respond(f"⏱ **Bot Uptime:** {uptime_str}")
     logger.info("User requested uptime.")
 
 def get_video_metadata(file_path):
@@ -96,22 +96,22 @@ async def handle_zip(event):
     try:
         message_file = event.message.file
         if not (message_file and message_file.name.endswith('.zip')):
-            await event.respond("Please upload a valid ZIP file.")
+            await event.respond("❌ **Invalid file type. Please upload a ZIP file.**")
             return
-        
+
         file_name = message_file.name
         file_size = message_file.size
 
         if file_size > MAX_FILE_SIZE:
-            await event.respond(f"'{file_name}' is too large (max 2 GB).")
+            await event.respond(f"❌ **'{file_name}' exceeds the 2 GB file size limit.**")
             return
 
         os.makedirs('downloads', exist_ok=True)
         zip_path = os.path.join('downloads', file_name)
 
-        progress_msg = await event.respond(f"Downloading ZIP file: {file_name}...")
+        progress_msg = await event.respond(f"📥 **Downloading ZIP file:** `{file_name}`\n\n**Please wait…**")
         await fast_download(client, event.message, zip_path, progress_bar_function=lambda d, t: asyncio.create_task(
-            update_progress(progress_msg, d, t, "Downloading...")))
+            update_progress(progress_msg, d, t, "Downloading ZIP")))
 
         unzip_dir = zip_path.rstrip('.zip')
         os.makedirs(unzip_dir, exist_ok=True)
@@ -119,76 +119,60 @@ async def handle_zip(event):
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(unzip_dir)
 
-        upload_tasks = []
+        # Unified progress message for uploads
+        upload_progress_msg = await event.respond(f"📤 **Uploading files from ZIP:** `{file_name}`\n\n**Please wait…**")
+        total_files = sum(len(files) for _, _, files in os.walk(unzip_dir))
+        uploaded_files = 0
+
         for root, _, files in os.walk(unzip_dir):
             for filename in files:
                 file_path = os.path.join(root, filename)
                 if os.path.getsize(file_path) > MAX_FILE_SIZE:
-                    await event.respond(f"Skipping '{filename}': File size exceeds 2 GB.")
+                    await event.respond(f"⚠️ Skipping `{filename}`: File size exceeds 2 GB.")
                     continue
-                upload_tasks.append(upload_file(event, file_path))
 
-        await asyncio.gather(*upload_tasks)
+                # Perform the upload
+                uploaded_path = await fast_upload(client, file_path)
+                await client.send_file(event.chat_id, file_path, caption=f"📄 **File Uploaded:** `{filename}`")
+                uploaded_files += 1
+
+                # Update progress message
+                await update_progress_files(upload_progress_msg, uploaded_files, total_files)
 
         cleanup(unzip_dir, zip_path)
-        await event.respond(f"All files from {file_name} have been uploaded successfully.")
+        await upload_progress_msg.edit(f"✅ **All files from `{file_name}` have been uploaded successfully.**")
 
     except Exception as e:
         logger.exception(f"Error processing ZIP file: {e}")
-        await event.respond(f"An error occurred: {e}")
-
-async def upload_file(event, file_path):
-    try:
-        file_name = os.path.basename(file_path)
-        mime_type, _ = mimetypes.guess_type(file_path)
-        is_video = mime_type and mime_type.startswith('video/')
-
-        if is_video:
-            metadata = get_video_metadata(file_path)
-            width, height, duration = metadata['width'], metadata['height'], metadata['duration']
-
-            if width == 0 or height == 0:
-                await event.respond(f"Skipping {file_name}: Unable to fetch video metadata.")
-                return
-
-            add_silent_audio(file_path)
-
-            attributes = [
-                DocumentAttributeVideo(
-                    supports_streaming=True,
-                    w=width,
-                    h=height,
-                    duration=duration
-                )
-            ]
-            progress_msg = await event.respond(f"Uploading video: {file_name}...")
-            await fast_upload(client, file_path, progress_bar_function=lambda d, t: asyncio.create_task(
-                update_progress(progress_msg, d, t, "Uploading...")))
-            await client.send_file(
-                event.chat_id,
-                file_path,
-                caption=f"Video: {file_name}",
-                attributes=attributes
-            )
-        else:
-            progress_msg = await event.respond(f"Uploading file: {file_name}...")
-            await fast_upload(client, file_path, progress_bar_function=lambda d, t: asyncio.create_task(
-                update_progress(progress_msg, d, t, "Uploading...")))
-            await client.send_file(
-                event.chat_id,
-                file_path,
-                caption=f"File: {file_name}"
-            )
-    except Exception as e:
-        logger.exception(f"Failed to upload {file_path}: {e}")
-        await event.respond(f"Failed to upload {file_name}: {e}")
+        await event.respond(f"❌ **An error occurred:** {e}")
 
 async def update_progress(message, downloaded, total, action):
     try:
         percent = (downloaded / total) * 100
-        await message.edit(f"{action} {percent:.2f}% complete")
+        progress_bar = "█" * int(percent // 5) + "░" * (20 - int(percent // 5))
+        progress_text = f"""
+**{action} Progress**
+[{progress_bar}] {percent:.2f}%
+
+**Downloaded:** {downloaded / 1024 / 1024:.2f} MB / {total / 1024 / 1024:.2f} MB
+"""
+        await message.edit(progress_text)
     except Exception as e:
         logger.error(f"Failed to update progress: {e}")
+
+async def update_progress_files(message, uploaded, total):
+    try:
+        percent = (uploaded / total) * 100
+        progress_bar = "█" * int(percent // 5) + "░" * (20 - int(percent // 5))
+        progress_text = f"""
+**Uploading Progress**
+[{progress_bar}] {percent:.2f}%
+
+**Uploaded Files:** {uploaded} / {total}
+"""
+        await message.edit(progress_text)
+    except Exception as e:
+        logger.error(f"Failed to update file upload progress: {e}")
 
 def cleanup(unzip_dir, zip_path):
     try:

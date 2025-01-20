@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import DocumentAttributeVideo
-from FastTelethonhelper import fast_download, fast_upload
+from telethon.tl.types import InputFile, DocumentAttributeVideo
+from FastTelethonhelper import fast_download, fast_upload  # Use FastTelethonhelper for downloads and uploads
 import subprocess
 import json
 import asyncio
@@ -44,28 +44,15 @@ logger = logging.getLogger("BotLogger")
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB limit for Telethon
 start_time = datetime.now()
 
-@client.on(events.NewMessage(pattern='/start'))
-async def start_command(event):
-    await event.respond("👋 **Welcome!**\n\nSend me a ZIP file, and I will upload its contents to this chat.")
-    logger.info("User started the bot.")
-
-@client.on(events.NewMessage(pattern='/help'))
-async def help_command(event):
-    await event.respond("📜 **Help**\n\nSend me a ZIP file, and I will process its contents.\n\n**Commands:**\n/start - Start the bot\n/help - Show this help message\n/uptime - Check bot uptime")
-    logger.info("User requested help.")
-
-@client.on(events.NewMessage(pattern='/uptime'))
-async def uptime_command(event):
-    uptime = datetime.now() - start_time
-    uptime_str = str(timedelta(seconds=uptime.total_seconds()))
-    await event.respond(f"⏱ **Bot Uptime:** {uptime_str}")
-    logger.info("User requested uptime.")
-
 def get_video_metadata(file_path):
+    """
+    Extract metadata from a video file using FFmpeg.
+    """
     try:
         cmd = [
-            'ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
-            'stream=width,height,duration', '-of', 'json', file_path
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height,duration',
+            '-of', 'json', file_path
         ]
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         metadata = json.loads(result.stdout)
@@ -80,10 +67,14 @@ def get_video_metadata(file_path):
         return {'width': 0, 'height': 0, 'duration': 0}
 
 def add_silent_audio(file_path):
+    """
+    Add silent audio to a video file to prevent it from being uploaded as a GIF.
+    """
     try:
         temp_path = f"{file_path}_temp.mp4"
         cmd = [
-            'ffmpeg', '-i', file_path, '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+            'ffmpeg', '-i', file_path, '-f', 'lavfi',
+            '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
             '-shortest', '-c:v', 'copy', '-c:a', 'aac', temp_path
         ]
         subprocess.run(cmd, check=True)
@@ -109,35 +100,71 @@ async def handle_zip(event):
         os.makedirs('downloads', exist_ok=True)
         zip_path = os.path.join('downloads', file_name)
 
+        # Download the ZIP file using FastTelethonhelper
         progress_msg = await event.respond(f"📥 **Downloading ZIP file:** `{file_name}`\n\n**Please wait…**")
         await fast_download(client, event.message, zip_path, progress_bar_function=lambda d, t: asyncio.create_task(
-            update_progress(progress_msg, d, t, "Downloading ZIP")))
+            update_progress(progress_msg, d, t, "Downloading ZIP")
+        ))
 
+        # Validate if the file is a valid ZIP
+        if not zipfile.is_zipfile(zip_path):
+            await progress_msg.edit("❌ **The uploaded file is not a valid ZIP archive.**")
+            os.remove(zip_path)
+            return
+
+        # Extract the ZIP file
         unzip_dir = zip_path.rstrip('.zip')
         os.makedirs(unzip_dir, exist_ok=True)
-
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(unzip_dir)
 
         # Unified progress message for uploads
         upload_progress_msg = await event.respond(f"📤 **Uploading files from ZIP:** `{file_name}`\n\n**Please wait…**")
+        total_size = sum(os.path.getsize(os.path.join(root, f)) for root, _, files in os.walk(unzip_dir) for f in files)
         total_files = sum(len(files) for _, _, files in os.walk(unzip_dir))
+        uploaded_size = 0
         uploaded_files = 0
 
         for root, _, files in os.walk(unzip_dir):
             for filename in files:
                 file_path = os.path.join(root, filename)
-                if os.path.getsize(file_path) > MAX_FILE_SIZE:
+                file_size = os.path.getsize(file_path)
+
+                if file_size > MAX_FILE_SIZE:
                     await event.respond(f"⚠️ Skipping `{filename}`: File size exceeds 2 GB.")
                     continue
 
-                # Perform the upload
-                uploaded_path = await fast_upload(client, file_path)
-                await client.send_file(event.chat_id, file_path, caption=f"📄 **File Uploaded:** `{filename}`")
+                mime_type = mimetypes.guess_type(file_path)[0]
+                is_video = mime_type and mime_type.startswith('video/')
+
+                # Add silent audio if the file is a video
+                if is_video:
+                    add_silent_audio(file_path)
+                    metadata = get_video_metadata(file_path)
+                    attributes = [
+                        DocumentAttributeVideo(
+                            supports_streaming=True,
+                            w=metadata['width'],
+                            h=metadata['height'],
+                            duration=metadata['duration']
+                        )
+                    ]
+                else:
+                    attributes = []
+
+                # Upload the file using fast upload
+                uploaded_file = await fast_upload(client, file_path)
+                await client.send_file(
+                    event.chat_id,
+                    uploaded_file,
+                    caption=f"📄 **File Uploaded:** `{filename}`",
+                    attributes=attributes
+                )
+                uploaded_size += file_size
                 uploaded_files += 1
 
-                # Update progress message
-                await update_progress_files(upload_progress_msg, uploaded_files, total_files)
+                # Update upload progress
+                await update_upload_progress(upload_progress_msg, uploaded_size, total_size, uploaded_files, total_files)
 
         cleanup(unzip_dir, zip_path)
         await upload_progress_msg.edit(f"✅ **All files from `{file_name}` have been uploaded successfully.**")
@@ -146,33 +173,28 @@ async def handle_zip(event):
         logger.exception(f"Error processing ZIP file: {e}")
         await event.respond(f"❌ **An error occurred:** {e}")
 
-async def update_progress(message, downloaded, total, action):
+async def update_progress(message, current, total, action):
     try:
-        percent = (downloaded / total) * 100
-        progress_bar = "█" * int(percent // 5) + "░" * (20 - int(percent // 5))
         progress_text = f"""
 **{action} Progress**
-[{progress_bar}] {percent:.2f}%
 
-**Downloaded:** {downloaded / 1024 / 1024:.2f} MB / {total / 1024 / 1024:.2f} MB
+**Completed:** {current / 1024 / 1024:.2f} MB / {total / 1024 / 1024:.2f} MB
 """
         await message.edit(progress_text)
     except Exception as e:
         logger.error(f"Failed to update progress: {e}")
 
-async def update_progress_files(message, uploaded, total):
+async def update_upload_progress(message, uploaded_size, total_size, uploaded_files, total_files):
     try:
-        percent = (uploaded / total) * 100
-        progress_bar = "█" * int(percent // 5) + "░" * (20 - int(percent // 5))
         progress_text = f"""
 **Uploading Progress**
-[{progress_bar}] {percent:.2f}%
 
-**Uploaded Files:** {uploaded} / {total}
+**Uploaded:** {uploaded_size / 1024 / 1024:.2f} MB / {total_size / 1024 / 1024:.2f} MB  
+**Files Uploaded:** {uploaded_files} / {total_files}
 """
         await message.edit(progress_text)
     except Exception as e:
-        logger.error(f"Failed to update file upload progress: {e}")
+        logger.error(f"Failed to update upload progress: {e}")
 
 def cleanup(unzip_dir, zip_path):
     try:

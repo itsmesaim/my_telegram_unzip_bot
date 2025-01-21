@@ -2,3 +2,4 @@ python-telegram-bot
 telethon
 python-dotenv
 FastTelethonhelper
+cryptg

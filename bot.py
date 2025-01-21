@@ -6,10 +6,10 @@ import logging
 import mimetypes
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, functions
 from telethon.sessions import StringSession
 from telethon.tl.types import InputFile, DocumentAttributeVideo
-from FastTelethonhelper import fast_download, fast_upload  # Use FastTelethonhelper for downloads and uploads
+from FastTelethonhelper import fast_download, fast_upload
 import subprocess
 import json
 import asyncio
@@ -34,15 +34,15 @@ client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 # Initialize logging
 logging.basicConfig(
-    filename='logs/bot.log',
+    level=logging.DEBUG,  # Set to DEBUG to see detailed logs in the terminal
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
 )
 logger = logging.getLogger("BotLogger")
 
 # Constants
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB limit for Telethon
 start_time = datetime.now()
+
 
 def get_video_metadata(file_path):
     """
@@ -66,6 +66,7 @@ def get_video_metadata(file_path):
         logger.error(f"Failed to extract metadata for {file_path}: {e}")
         return {'width': 0, 'height': 0, 'duration': 0}
 
+
 def add_silent_audio(file_path):
     """
     Add silent audio to a video file to prevent it from being uploaded as a GIF.
@@ -79,19 +80,53 @@ def add_silent_audio(file_path):
         ]
         subprocess.run(cmd, check=True)
         os.replace(temp_path, file_path)
+        print(f"✅ Added silent audio to {file_path}")
     except Exception as e:
         logger.error(f"Failed to add silent audio to {file_path}: {e}")
 
+
+@client.on(events.NewMessage(pattern='/start'))
+async def start_command(event):
+    """
+    Handles the /start command.
+    """
+    print(f"📩 Received /start from {event.chat_id}")
+    await event.respond("👋 Hello! Send me a ZIP file, and I will upload its contents to this chat.")
+    logger.info("User started the bot.")
+
+
+@client.on(events.NewMessage(pattern='/help'))
+async def help_command(event):
+    """
+    Handles the /help command.
+    """
+    print(f"📩 Received /help from {event.chat_id}")
+    await event.respond("📜 **Help**\n\nSend me a ZIP file, and I will process its contents.")
+    logger.info("User requested help.")
+
+
+@client.on(events.NewMessage(pattern='/uptime'))
+async def uptime_command(event):
+    """
+    Handles the /uptime command.
+    """
+    uptime = datetime.now() - start_time
+    uptime_str = str(timedelta(seconds=uptime.total_seconds()))
+    print(f"📩 Received /uptime from {event.chat_id}")
+    await event.respond(f"⏱ **Bot Uptime:** {uptime_str}")
+    logger.info("User requested uptime.")
+
+
 @client.on(events.NewMessage(func=lambda e: e.message.file and e.message.file.name.endswith('.zip')))
 async def handle_zip(event):
+    """
+    Handles ZIP file uploads.
+    """
     try:
         message_file = event.message.file
-        if not (message_file and message_file.name.endswith('.zip')):
-            await event.respond("❌ **Invalid file type. Please upload a ZIP file.**")
-            return
-
         file_name = message_file.name
         file_size = message_file.size
+        print(f"📂 Received ZIP file: {file_name} ({file_size / 1024 / 1024:.2f} MB)")
 
         if file_size > MAX_FILE_SIZE:
             await event.respond(f"❌ **'{file_name}' exceeds the 2 GB file size limit.**")
@@ -100,11 +135,13 @@ async def handle_zip(event):
         os.makedirs('downloads', exist_ok=True)
         zip_path = os.path.join('downloads', file_name)
 
-        # Download the ZIP file using FastTelethonhelper
+        # Download the ZIP file
         progress_msg = await event.respond(f"📥 **Downloading ZIP file:** `{file_name}`\n\n**Please wait…**")
+        print(f"⬇️ Starting download for {file_name}")
         await fast_download(client, event.message, zip_path, progress_bar_function=lambda d, t: asyncio.create_task(
             update_progress(progress_msg, d, t, "Downloading ZIP")
         ))
+        print(f"✅ Download complete for {file_name}")
 
         # Validate if the file is a valid ZIP
         if not zipfile.is_zipfile(zip_path):
@@ -117,6 +154,7 @@ async def handle_zip(event):
         os.makedirs(unzip_dir, exist_ok=True)
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(unzip_dir)
+        print(f"✅ Extracted ZIP file: {file_name}")
 
         # Unified progress message for uploads
         upload_progress_msg = await event.respond(f"📤 **Uploading files from ZIP:** `{file_name}`\n\n**Please wait…**")
@@ -132,6 +170,7 @@ async def handle_zip(event):
 
                 if file_size > MAX_FILE_SIZE:
                     await event.respond(f"⚠️ Skipping `{filename}`: File size exceeds 2 GB.")
+                    print(f"⚠️ Skipped {filename} (File size too large)")
                     continue
 
                 mime_type = mimetypes.guess_type(file_path)[0]
@@ -162,6 +201,7 @@ async def handle_zip(event):
                 )
                 uploaded_size += file_size
                 uploaded_files += 1
+                print(f"✅ Uploaded {filename} ({file_size / 1024 / 1024:.2f} MB)")
 
                 # Update upload progress
                 await update_upload_progress(upload_progress_msg, uploaded_size, total_size, uploaded_files, total_files)
@@ -171,20 +211,30 @@ async def handle_zip(event):
 
     except Exception as e:
         logger.exception(f"Error processing ZIP file: {e}")
+        print(f"❌ An error occurred: {e}")
         await event.respond(f"❌ **An error occurred:** {e}")
 
+
 async def update_progress(message, current, total, action):
+    """
+    Updates the download progress.
+    """
     try:
         progress_text = f"""
 **{action} Progress**
 
 **Completed:** {current / 1024 / 1024:.2f} MB / {total / 1024 / 1024:.2f} MB
 """
+        print(f"🔄 {action} Progress: {current / 1024 / 1024:.2f} MB / {total / 1024 / 1024:.2f} MB")
         await message.edit(progress_text)
     except Exception as e:
         logger.error(f"Failed to update progress: {e}")
 
+
 async def update_upload_progress(message, uploaded_size, total_size, uploaded_files, total_files):
+    """
+    Updates the upload progress.
+    """
     try:
         progress_text = f"""
 **Uploading Progress**
@@ -192,30 +242,39 @@ async def update_upload_progress(message, uploaded_size, total_size, uploaded_fi
 **Uploaded:** {uploaded_size / 1024 / 1024:.2f} MB / {total_size / 1024 / 1024:.2f} MB  
 **Files Uploaded:** {uploaded_files} / {total_files}
 """
+        print(f"🔄 Upload Progress: {uploaded_size / 1024 / 1024:.2f} MB / {total_size / 1024 / 1024:.2f} MB, {uploaded_files}/{total_files} files")
         await message.edit(progress_text)
     except Exception as e:
         logger.error(f"Failed to update upload progress: {e}")
 
+
 def cleanup(unzip_dir, zip_path):
+    """
+    Cleans up the extracted files and downloaded ZIP.
+    """
     try:
         if os.path.exists(zip_path):
             os.remove(zip_path)
         shutil.rmtree(unzip_dir, ignore_errors=True)
+        print(f"🧹 Cleaned up {zip_path} and extracted files.")
     except Exception as e:
         logger.exception(f"Cleanup error: {e}")
 
+
 async def main():
-    await client.start(bot_token=BOT_TOKEN)
+    """
+    Starts the bot and handles reconnections.
+    """
+    while True:
+        try:
+            await client.start(bot_token=BOT_TOKEN)
+            print("🚀 Bot is running...")
+            await client.run_until_disconnected()
+        except Exception as e:
+            logger.error(f"Disconnected! Reconnecting in 5 seconds: {e}")
+            print(f"❌ Disconnected! Reconnecting in 5 seconds: {e}")
+            await asyncio.sleep(5)
 
-    if not os.path.exists(SESSION_FILE):
-        session_string = StringSession.save(client.session)
-        with open(SESSION_FILE, 'w') as session_file:
-            session_file.write(session_string)
-        print("Session string saved to 'session_save.txt'")
-
-    logger.info("Bot is running...")
-    await client.run_until_disconnected()
 
 if __name__ == '__main__':
-    import asyncio
     asyncio.run(main())

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, functions
 from telethon.sessions import StringSession
-from telethon.tl.types import InputFile, DocumentAttributeVideo
+from telethon.tl.types import DocumentAttributeVideo
 from FastTelethonhelper import fast_download, fast_upload
 import subprocess
 import json
@@ -34,7 +34,7 @@ client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 # Initialize logging
 logging.basicConfig(
-    level=logging.DEBUG,  # Set to DEBUG to see detailed logs in the terminal
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger("BotLogger")
@@ -42,6 +42,23 @@ logger = logging.getLogger("BotLogger")
 # Constants
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB limit for Telethon
 start_time = datetime.now()
+
+# Task Queue
+task_queue = asyncio.Queue()
+
+
+async def process_tasks():
+    """
+    Process tasks from the task queue one at a time.
+    """
+    while True:
+        task = await task_queue.get()
+        try:
+            await handle_zip_task(*task)
+        except Exception as e:
+            logger.exception(f"Error processing task: {e}")
+        finally:
+            task_queue.task_done()
 
 
 def get_video_metadata(file_path):
@@ -120,13 +137,21 @@ async def uptime_command(event):
 @client.on(events.NewMessage(func=lambda e: e.message.file and e.message.file.name.endswith('.zip')))
 async def handle_zip(event):
     """
-    Handles ZIP file uploads.
+    Adds a new ZIP task to the queue.
+    """
+    print(f"📂 Queuing task for ZIP file: {event.message.file.name}")
+    await task_queue.put((event,))
+
+
+async def handle_zip_task(event):
+    """
+    Processes a ZIP file task.
     """
     try:
         message_file = event.message.file
         file_name = message_file.name
         file_size = message_file.size
-        print(f"📂 Received ZIP file: {file_name} ({file_size / 1024 / 1024:.2f} MB)")
+        print(f"📂 Processing ZIP file: {file_name} ({file_size / 1024 / 1024:.2f} MB)")
 
         if file_size > MAX_FILE_SIZE:
             await event.respond(f"❌ **'{file_name}' exceeds the 2 GB file size limit.**")
@@ -208,6 +233,7 @@ async def handle_zip(event):
 
         cleanup(unzip_dir, zip_path)
         await upload_progress_msg.edit(f"✅ **All files from `{file_name}` have been uploaded successfully.**")
+        print(f"🎉 Task completed for ZIP file: {file_name}")
 
     except Exception as e:
         logger.exception(f"Error processing ZIP file: {e}")
@@ -263,8 +289,9 @@ def cleanup(unzip_dir, zip_path):
 
 async def main():
     """
-    Starts the bot and handles reconnections.
+    Starts the bot and task processing loop.
     """
+    asyncio.create_task(process_tasks())
     while True:
         try:
             await client.start(bot_token=BOT_TOKEN)

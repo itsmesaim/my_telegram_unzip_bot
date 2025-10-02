@@ -305,61 +305,87 @@ def create_mixed_media_groups(files: List[Dict[str, Any]], max_group_size: int =
 @client.on(events.NewMessage(pattern="/cancel"))
 async def cancel_command(event):
     """
-    Handles the /cancel command to stop ongoing uploads.
+    Handles the /cancel command to stop ongoing uploads AND remove queued uploads belonging to the user.
     """
     user_id = event.chat_id
 
-    if user_id not in active_tasks:
-        await event.respond("ℹ️ **No active upload to cancel.**")
-        return
+    removed_from_queue = 0
 
-    task_info = active_tasks[user_id]
-    task_info["cancel_flag"] = True
+    # Remove queued tasks for this user from the queue
+    try:
+        old_queue = list(task_queue._queue)
+        new_queue = [item for item in old_queue if getattr(item[0], "chat_id", None) != user_id]
+        removed_from_queue = len(old_queue) - len(new_queue)
+        # Replace queue contents
+        task_queue._queue.clear()
+        task_queue._queue.extend(new_queue)
+    except Exception as e:
+        logger.error(f"Failed to clean queue for user {user_id}: {e}")
 
-    # Cancel the task
-    if task_info.get("task") and not task_info["task"].done():
-        task_info["task"].cancel()
-        await event.respond(
-            f"🛑 **Cancelling upload...**\n"
-            f"📁 File: `{task_info.get('zip_name', '<unknown>')}`\n\n"
-            f"Please wait for cleanup..."
-        )
-        logger.info(f"User {user_id} cancelled upload of {task_info.get('zip_name')}")
+    active_cancelled = False
+    if user_id in active_tasks:
+        task_info = active_tasks[user_id]
+        task_info["cancel_flag"] = True
+
+        # Cancel the task
+        if task_info.get("task") and not task_info["task"].done():
+            task_info["task"].cancel()
+            active_cancelled = True
+            logger.info(f"User {user_id} cancelled active upload of {task_info.get('zip_name')}")
+    # Respond appropriately
+    if active_cancelled and removed_from_queue:
+        await event.respond(f"🛑 **Cancelled active upload** and removed **{removed_from_queue}** queued upload(s).")
+    elif active_cancelled:
+        await event.respond("🛑 **Cancelled active upload.**")
+    elif removed_from_queue:
+        await event.respond(f"🗑 **Removed {removed_from_queue} queued upload(s).**")
     else:
-        await event.respond("ℹ️ **Upload task is already finishing.**")
+        await event.respond("ℹ️ **No active or queued uploads to cancel.**")
 
 
 @client.on(events.NewMessage(pattern="/status"))
 async def status_command(event):
     """
-    Check the status of current upload.
+    Check the status of current upload and queued uploads for this user.
     """
     user_id = event.chat_id
 
-    if user_id not in active_tasks:
-        queue_position = None
-        # Accessing internal queue for user-facing position — acceptable but be aware it's internal
-        queue_items = list(task_queue._queue)
-        for idx, item in enumerate(queue_items):
-            item_event = item[0] if isinstance(item, (list, tuple)) and item else None
-            if item_event and getattr(item_event, "chat_id", None) == user_id:
-                queue_position = idx + 1
-                break
+    # Count queued uploads for user and find first queued position overall
+    queued_positions = []
+    overall_queue = list(task_queue._queue)
+    for idx, item in enumerate(overall_queue):
+        item_event = item[0] if isinstance(item, (list, tuple)) and item else None
+        if item_event and getattr(item_event, "chat_id", None) == user_id:
+            queued_positions.append(idx + 1)  # 1-based overall positions
 
-        if queue_position:
-            await event.respond(f"⏳ **Your upload is in queue**\nPosition: {queue_position}")
-        else:
-            await event.respond("ℹ️ **No active uploads or queued tasks.**")
-    else:
+    user_queued_count = len(queued_positions)
+    if user_id not in active_tasks and user_queued_count == 0:
+        await event.respond("ℹ️ **No active uploads or queued tasks.**")
+        return
+
+    if user_id in active_tasks:
         task_info = active_tasks[user_id]
-        status_msg = (
-            "📊 **Upload Status**\n\n"
-            f"📁 **File:** `{task_info.get('zip_name', '<unknown>')}`\n"
-            "⚡ **Status:** Processing\n"
-            "🛑 **Cancel:** Use /cancel to stop\n\n"
-            "**Tip:** Check messages above for detailed progress."
+        msg_lines = [
+            "📊 **Upload Status**",
+            "",
+            f"📁 **Active File:** `{task_info.get('zip_name', '<unknown>')}`",
+            "⚡ **Status:** Processing",
+            f"🧾 **Queued uploads (you):** {user_queued_count}",
+        ]
+        if user_queued_count:
+            msg_lines.append(f"🔢 **Your next queued item global position:** {queued_positions[0]}")
+        msg_lines.append("\n🛑 Use /cancel to stop active upload and clear your queued uploads.")
+        await event.respond("\n".join(msg_lines))
+    else:
+        # No active, but have queued items
+        # Provide overall position of the first queued item and total queued for user
+        first_pos = queued_positions[0] if queued_positions else None
+        await event.respond(
+            f"⏳ **Your upload is in queue**\n"
+            f"Position (global): {first_pos}\n"
+            f"Your queued uploads: {user_queued_count}\n\n"
+            "🛑 Use /cancel to remove queued uploads."
         )
-        await event.respond(status_msg)
 
 
 @client.on(events.NewMessage(pattern="/start"))
@@ -376,11 +402,11 @@ async def start_command(event):
         "• 📦 **Mixed Media Groups**: Photos and videos uploaded together\n"
         "• 🛑 **Cancellable Uploads**: Stop uploads anytime with /cancel\n"
         "• 🎬 **Smart Processing**: Auto-optimization for all media\n"
-        "• ⚡ **Queue System**: Multiple tasks handled efficiently\n\n"
+        "• ⚡ **Queue System**: Multiple uploads per user are supported\n\n"
         "**Commands:**\n"
         "/start - Start the bot\n"
         "/help - Show help menu\n"
-        "/cancel - Cancel current upload\n"
+        "/cancel - Cancel current upload and clear queued uploads\n"
         "/status - Check upload status\n"
         "/settings - Configure preferences\n"
         "/uptime - Check bot uptime\n"
@@ -457,7 +483,7 @@ async def help_command(event):
         "**Commands:**\n"
         "/start - Initialize bot\n"
         "/help - Show this menu\n"
-        "/cancel - Stop current upload\n"
+        "/cancel - Stop current upload and clear queued uploads\n"
         "/status - Check upload status\n"
         "/settings - View preferences\n"
         "/toggle_group - Toggle group upload\n"
@@ -499,30 +525,29 @@ async def uptime_command(event):
 async def handle_zip(event):
     """
     Adds a new ZIP task to the queue.
+    Allows multiple ZIPs per user to be queued.
     """
     user_id = event.chat_id
     file_name = getattr(event.message.file, "name", "<unknown>")
 
-    # Check if user already has an active task
-    if user_id in active_tasks:
-        await event.respond(
-            f"⚠️ **You already have an active upload.**\n"
-            f"📁 Current: `{active_tasks[user_id].get('zip_name', '<unknown>')}`\n\n"
-            f"Use /cancel to stop it first."
-        )
-        return
+    # Compute existing queued uploads for this user
+    overall_queue = list(task_queue._queue)
+    existing_user_queue = sum(1 for item in overall_queue if getattr(item[0], "chat_id", None) == user_id)
 
-    queue_size = task_queue.qsize()
+    overall_position = task_queue.qsize() + 1
+    user_position = existing_user_queue + 1
+    user_total_after_enqueue = existing_user_queue + 1
 
     await event.respond(
         f"📥 **ZIP file received:** `{file_name}`\n"
-        f"📊 **Position in queue:** {queue_size + 1}\n\n"
-        f"💡 **Tip:** Use /cancel anytime to stop the upload"
+        f"📊 **Global position in queue:** {overall_position}\n"
+        f"🧾 **Your uploads in queue (including this):** {user_total_after_enqueue}\n\n"
+        f"💡 **Tip:** Use /cancel to stop active upload and clear your queued uploads"
     )
 
     # enqueue event as a single-item tuple for process_tasks
     await task_queue.put((event,))
-    logger.info(f"Queued ZIP file: {file_name}")
+    logger.info(f"Queued ZIP file: {file_name} (user: {user_id})")
 
 
 async def check_cancel_flag(user_id: int):

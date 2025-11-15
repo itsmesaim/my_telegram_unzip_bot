@@ -117,6 +117,200 @@ async def process_tasks():
                 del active_tasks[user_id]
             task_queue.task_done()
 
+# --- Added: extended archive support and per-user upload mode/password handling ---
+try:
+    import pyzipper
+except Exception:
+    pyzipper = None
+
+try:
+    import rarfile
+except Exception:
+    rarfile = None
+
+import tarfile
+try:
+    import py7zr
+except Exception:
+    py7zr = None
+
+from typing import Tuple
+
+# Per-user settings
+user_modes = {}          # user_id -> "media" or "doc"
+user_passwords = {}      # user_id -> bytes
+pending_extractions = {} # user_id -> dict(zip_path, unzip_dir, file_name, progress_msg_id)
+
+def extract_archive_sync(file_path: str, unzip_dir: str, user_id: int) -> Tuple[bool, str]:
+
+    password = user_passwords.get(user_id)
+    try:
+        # ZIP (including ZIP64, encrypted)
+        if zipfile.is_zipfile(file_path):
+            if pyzipper is not None:
+                with pyzipper.AESZipFile(file_path) as zf:
+                    namelist = zf.namelist()
+                    encrypted = any((zi.flag_bits & 0x1) for zi in zf.infolist())
+                    if encrypted and not password:
+                        return False, "NEED_PASSWORD"
+                    for member in namelist:
+                        if member.endswith('/'):
+                            os.makedirs(os.path.join(unzip_dir, member), exist_ok=True)
+                            continue
+                        try:
+                            if password:
+                                zf.extract(member, path=unzip_dir, pwd=password)
+                            else:
+                                zf.extract(member, path=unzip_dir)
+                        except RuntimeError as e:
+                            if "password" in str(e).lower():
+                                return False, "NEED_PASSWORD"
+                            raise
+            else:
+                with zipfile.ZipFile(file_path, "r") as zf:
+                    namelist = zf.namelist()
+                    encrypted = any((zi.flag_bits & 0x1) for zi in zf.infolist())
+                    if encrypted and not password:
+                        return False, "NEED_PASSWORD"
+                    for member in namelist:
+                        if member.endswith('/'):
+                            os.makedirs(os.path.join(unzip_dir, member), exist_ok=True)
+                            continue
+                        if password:
+                            zf.extract(member, path=unzip_dir, pwd=password)
+                        else:
+                            zf.extract(member, path=unzip_dir)
+            return True, None
+
+        # RAR
+        if rarfile is not None and rarfile.is_rarfile(file_path):
+            try:
+                with rarfile.RarFile(file_path) as rf:
+                    needs_pw = False
+                    try:
+                        needs_pw = getattr(rf, "needs_password", lambda: False)()
+                    except Exception:
+                        needs_pw = False
+                    if needs_pw and not password:
+                        return False, "NEED_PASSWORD"
+                    rf.extractall(path=unzip_dir, pwd=password.decode() if password else None)
+                return True, None
+            except Exception as e:
+                msg = str(e)
+                if "No such file or directory" in msg or "unrar" in msg.lower() or "bsdtar" in msg.lower():
+                    return False, "❌ RAR extraction failed: required system helper (unrar/bsdtar) not found. Install `unrar` or `bsdtar`."
+                return False, f"❌ RAR extraction failed: {e}"
+
+        # TAR (tar, tar.gz, tgz, tar.bz2)
+        if tarfile.is_tarfile(file_path):
+            with tarfile.open(file_path) as tf:
+                tf.extractall(path=unzip_dir)
+            return True, None
+
+        # 7Z
+        if py7zr is not None and py7zr.is_7zfile(file_path):
+            with py7zr.SevenZipFile(file_path, mode="r", password=password.decode() if password else None) as z7:
+                z7.extractall(path=unzip_dir)
+            return True, None
+
+        return False, "⚠️ Unsupported archive format."
+    except RuntimeError as e:
+        return False, f"❌ Extraction failed: {e}"
+    except Exception as e:
+        return False, f"❌ Extraction failed: {e}"
+
+async def process_and_upload(event, unzip_dir: str, zip_path: str, file_name: str, progress_msg, user_id: int):
+    """
+    Reusable logic: prepare files_to_upload and call existing upload routines.
+    This is mostly lifted from the original code to avoid duplication.
+    """
+    files_to_upload = []
+    for root, _, files in os.walk(unzip_dir):
+        for filename in files:
+            await check_cancel_flag(user_id)
+            file_path = os.path.join(root, filename)
+            f_size = os.path.getsize(file_path)
+            if f_size > MAX_FILE_SIZE:
+                await event.respond(f"⚠️ Skipping `{filename}`: Exceeds 2GB limit")
+                continue
+            mime_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+            # honor per-user mode: 'doc' forces non-media upload
+            if user_modes.get(user_id) == "doc":
+                mime_type = "application/octet-stream"
+            files_to_upload.append(
+                {"path": file_path, "name": filename, "size": f_size, "mime_type": mime_type}
+            )
+
+    # No files found
+    if not files_to_upload:
+        try:
+            await progress_msg.edit("⚠️ No files were extracted from the archive.")
+        except Exception:
+            pass
+        cleanup(unzip_dir, zip_path)
+        return
+
+    # Determine user preferences (fallback to defaults in original user_preferences dict)
+    prefs = user_preferences.get(user_id, {"group_upload": True, "group_size": 10})
+
+    # Upload files using the existing helpers
+    if prefs.get("group_upload", True):
+        await upload_files_grouped(event, files_to_upload, progress_msg, file_name, prefs.get("group_size", 10), user_id)
+    else:
+        await upload_files_individual(event, files_to_upload, progress_msg, file_name, user_id)
+
+    cleanup(unzip_dir, zip_path)
+
+    # Send summary (keep message structure similar to original)
+    try:
+        summary_msg = (
+            "✅ **Upload Complete!**\n\n"
+            f"📁 **Source:** `{file_name}`\n"
+            f"📊 **Files Processed:** {len(files_to_upload)}\n"
+            f"🎯 **Upload Mode:** {'Documents only' if user_modes.get(user_id)=='doc' else 'Mixed/Auto'}\n"
+        )
+        await event.respond(summary_msg)
+    except Exception:
+        pass
+
+
+@client.on(events.NewMessage(pattern=r"^/mode(?:$|\s)"))
+async def set_mode_handler(event):
+    parts = event.message.text.split()
+    if len(parts) < 2 or parts[1].lower() not in ("media", "doc"):
+        await event.respond("Usage: /mode <media|doc>")
+        return
+    mode = parts[1].lower()
+    user_modes[event.chat_id] = mode
+    await event.respond(f"✅ Upload mode set to *{mode}*")
+
+@client.on(events.NewMessage(pattern=r"^/unzip(?:$|\s)"))
+async def set_password_handler(event):
+    parts = event.message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await event.respond("Usage: /unzip <password> (saves password for pending password-protected archive)")
+        return
+    pw = parts[1].strip()
+    user_passwords[event.chat_id] = pw.encode()
+    await event.respond("🔑 Password saved for next extraction.")
+
+    # If user had a pending extraction, try to resume
+    pend = pending_extractions.pop(event.chat_id, None)
+    if pend:
+        try:
+            await event.respond("🔄 Resuming extraction with provided password...")
+            ok, err = extract_archive_sync(pend["zip_path"], pend["unzip_dir"], event.chat_id)
+            if not ok:
+                await event.respond(err or "❌ Extraction failed.")
+                cleanup(pend["unzip_dir"], pend["zip_path"])
+                return
+            await process_and_upload(event, pend["unzip_dir"], pend["zip_path"], pend["file_name"], await event.respond("📂 Preparing uploads..."), event.chat_id)
+        except Exception as e:
+            await event.respond(f"❌ Failed to resume extraction: {e}")
+            cleanup(pend.get("unzip_dir"), pend.get("zip_path"))
+
+# --- End of added code ---
+
 
 def get_video_metadata(file_path: str) -> Dict[str, int]:
     """
@@ -602,35 +796,27 @@ async def handle_zip_task(event):
         # Check for cancellation after download
         await check_cancel_flag(user_id)
 
-        # Validate ZIP
-        if not zipfile.is_zipfile(zip_path):
-            try:
-                await progress_msg.edit("❌ **Invalid ZIP archive.**")
-            except Exception:
-                pass
-            os.remove(zip_path)
-            return
-
-        # Extract ZIP
+        # Validate archive (supports ZIP, RAR, 7z, tar, etc.)
         unzip_dir = os.path.splitext(zip_path)[0]
         os.makedirs(unzip_dir, exist_ok=True)
 
-        with zipfile.ZipFile(zip_path, "r") as zip_ref:
-            total_files = len(zip_ref.namelist())
+        # Try to extract using extended extractor
+        ok, err = extract_archive_sync(zip_path, unzip_dir, user_id)
+        if err == 'NEED_PASSWORD':
+            # Archive is encrypted and user password not provided - ask user to supply it
+            pending_extractions[user_id] = {'zip_path': zip_path, 'unzip_dir': unzip_dir, 'file_name': file_name, 'progress_msg_id': getattr(progress_msg, 'id', None)}
+            await event.respond('🔐 Archive is password-protected. Reply to this message with the password or send /unzip <password>')
+            return
+        if not ok:
             try:
-                await progress_msg.edit(
-                    f"📂 **Extracting:** {total_files} files from `{file_name}`\n"
-                    f"⏳ Please wait... (Use /cancel to stop)"
-                )
+                await progress_msg.edit(f"{err}")
             except Exception:
                 pass
+            cleanup(unzip_dir, zip_path)
+            return
 
-            # Extract with cancellation check
-            for member in zip_ref.namelist():
-                await check_cancel_flag(user_id)
-                zip_ref.extract(member, unzip_dir)
-
-        # Prepare files for upload
+        # Extraction succeeded — continue to prepare files for upload
+# Prepare files for upload
         files_to_upload: List[Dict[str, Any]] = []
         for root, _, files in os.walk(unzip_dir):
             for filename in files:

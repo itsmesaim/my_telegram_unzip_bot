@@ -183,8 +183,10 @@ async def start(e) -> None:
     await e.reply(
         f"**✨ Premium Unzip Bot**\n**@{DEVELOPER}**\n\n"
         f"🟢 **Uptime:** `{uptime}`\n\n"
-        "Send any archive (ZIP • RAR • 7Z • TAR)\n"
-        "Password protected • Muted videos fixed • Mixed albums\n\n"
+        "Send any archive (ZIP • RAR • 7Z)\n"
+        "Support password protected files\n"
+        "Support All files(pdf, csv, xml, etc)\n"
+        "•Mixed albums\n\n"
         "Ready!",
         buttons=[
             [

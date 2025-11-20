@@ -1,0 +1,46 @@
+# Python & Virtual Environment
+venv/
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py,cache
+
+# Bot session & secrets
+session_save.txt
+*.session
+*.session-journal
+
+# Downloaded & extracted files (VERY IMPORTANT)
+downloads/
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+*.bz2
+*_extracted/
+
+# IDE / Editor junk
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-workspace
+*.sublime-project
+
+# OS garbage
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs & temp
+*.log
+*.tmp
+*.temp
+*.bak
+
+# FastTelethon temp files
+*.part
+*.download

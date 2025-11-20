@@ -307,12 +307,40 @@ async def handle_archive(event) -> None:
         return
 
     files = []
-    for root, _, fs in os.walk(extract_to):
-        for f in fs:
-            fp = os.path.join(root, f)
-            if os.path.getsize(fp) <= 2_000_000_000:
-                mime = mimetypes.guess_type(fp)[0] or "application/octet-stream"
-                files.append({"path": fp, "name": f, "mime": mime})
+    for root, _, filenames in os.walk(extract_to):
+        for filename in filenames:
+            fp = os.path.join(root, filename)
+
+            # Skip files > 2GB
+            if os.path.getsize(fp) > 2_000_000_000:
+                logger.info(f"Skipping {filename} (>2GB)")
+                continue
+
+            # SUPER MIME FIX – SOLVES PDF ERROR + ALL WEIRD FILES
+            guessed_mime = mimetypes.guess_type(fp)[0]
+            lower_name = filename.lower()
+
+            if guessed_mime is None or guessed_mime == "application/octet-stream":
+                if lower_name.endswith(".pdf"):
+                    mime = "application/pdf"
+                elif lower_name.endswith((".doc", ".docx")):
+                    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                elif lower_name.endswith((".xls", ".xlsx")):
+                    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                elif lower_name.endswith((".ppt", ".pptx")):
+                    mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                elif lower_name.endswith((".txt", ".log", ".csv", ".md")):
+                    mime = "text/plain"
+                elif lower_name.endswith((".html", ".htm")):
+                    mime = "text/html"
+                elif lower_name.endswith(".epub"):
+                    mime = "application/epub+zip"
+                else:
+                    mime = "application/octet-stream"
+            else:
+                mime = guessed_mime
+
+            files.append({"path": fp, "name": filename, "mime": mime})
 
     if not files:
         await status.edit("No files found")

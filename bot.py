@@ -60,6 +60,12 @@ user_passwords: dict[int, bytes] = {}
 pending_tasks: dict[int, bool] = {}
 active_uploads: dict[int, int] = {}
 
+# ============================= QUEUE SYSTEM =============================
+task_queue = asyncio.Queue()
+queue_list = []  # Track queue for status display
+is_processing = False
+current_user = None
+
 
 # ============================= MUTED VIDEO  =============================
 def video_has_audio(path: str) -> bool:
@@ -176,102 +182,46 @@ async def update_progress(
         pass
 
 
-# ============================= COMMANDS & BUTTONS =============================
-@client.on(events.NewMessage(pattern="/start"))
-async def start(e) -> None:
-    uptime = str(datetime.now() - start_time).split(".")[0]
-    await e.reply(
-        f"**✨ Premium Unzip Bot**\n**@{DEVELOPER}**\n\n"
-        f"🟢 **Uptime:** `{uptime}`\n\n"
-        "Send any archive (ZIP • RAR • 7Z)\n"
-        "Support password protected files\n"
-        "Support All files(pdf, csv, xml, etc)\n"
-        "•Mixed albums\n\n"
-        "Ready!",
-        buttons=[
-            [
-                Button.inline("📊 Status", b"status"),
-                Button.inline("ℹ️ Help", b"help"),
-                Button.inline("⏱ Uptime", b"uptime"),
-            ],
-            [Button.url("Developer", f"https://t.me/{DEVELOPER}")],
-        ],
-    )
+# ============================= QUEUE WORKER =============================
+async def queue_worker():
+    """Process one task at a time from the queue"""
+    global is_processing, current_user
+    
+    while True:
+        task_data = await task_queue.get()
+        is_processing = True
+        current_user = task_data["user_id"]
+        
+        try:
+            await process_archive(task_data)
+        except Exception as e:
+            logger.error(f"Queue worker error: {e}")
+            try:
+                await task_data["status"].edit(f"❌ Error: {str(e)}")
+            except:
+                pass
+        finally:
+            # Remove from queue list
+            queue_list[:] = [q for q in queue_list if q["user_id"] != task_data["user_id"]]
+            is_processing = False
+            current_user = None
+            task_queue.task_done()
 
 
-@client.on(events.CallbackQuery(data=b"status"))
-async def cb_status(e) -> None:
-    await e.answer(
-        (
-            "No active task"
-            if e.sender_id not in active_uploads
-            else f"Uploading {active_uploads[e.sender_id]} files..."
-        ),
-        alert=True,
-    )
-
-
-@client.on(events.CallbackQuery(data=b"help"))
-async def cb_help(e) -> None:
-    await e.reply(
-        "**Help**\n• Send archive\n• Password: `/pass abc123`\n• Cancel anytime\nSupported: ZIP RAR 7Z TAR\nMade by @hellopeter3"
-    )
-
-
-@client.on(events.CallbackQuery(data=b"uptime"))
-async def cb_uptime(e) -> None:
-    await e.answer(str(datetime.now() - start_time).split(".")[0], alert=True)
-
-
-@client.on(events.CallbackQuery(data=b"cancel"))
-async def cancel(e) -> None:
-    if e.sender_id in pending_tasks:
-        pending_tasks[e.sender_id] = True
-        await e.answer("Cancelled!", alert=True)
-
-
-# Text commands
-@client.on(events.NewMessage(pattern="/status"))
-async def cmd_status(e) -> None:
-    await e.reply(
-        "No active task"
-        if e.sender_id not in active_uploads
-        else f"📤 Uploading {active_uploads[e.sender_id]} files left"
-    )
-
-
-@client.on(events.NewMessage(pattern="/uptime"))
-async def cmd_uptime(e) -> None:
-    await e.reply(f"⏱ **Uptime:** {str(datetime.now() - start_time).split('.')[0]}")
-
-
-@client.on(events.NewMessage(pattern="/pass"))
-async def set_pass(e) -> None:
-    parts = e.text.split()
-    if len(parts) < 2:
-        await e.reply("Usage: `/pass your_password`")
-        return
-    user_passwords[e.sender_id] = " ".join(parts[1:]).encode()
-    await e.reply("✅ Password saved! Resend the file.")
-    logger.info(f"Password set by {e.sender_id}")
-
-
-# ============================= MAIN HANDLER =============================
-@client.on(
-    events.NewMessage(
-        func=lambda e: e.file
-        and e.file.name
-        and e.file.name.lower().endswith(
-            (".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2")
-        )
-    )
-)
-async def handle_archive(event) -> None:
-    user_id = event.sender_id
+# ============================= PROCESS ARCHIVE (Main Logic) =============================
+async def process_archive(task_data):
+    """Main processing function - extracted from handle_archive"""
+    event = task_data["event"]
+    status = task_data["status"]
+    user_id = task_data["user_id"]
+    
     pending_tasks[user_id] = False
     active_uploads[user_id] = 0
 
-    status = await event.reply(
+    # Store archive name for final message
+    archive_name = event.file.name
+
+    await status.edit(
         "⬇️ **Downloading...**", buttons=[[Button.inline("❌ Cancel", b"cancel")]]
     )
     path = f"downloads/{event.file.name}"
@@ -313,12 +263,10 @@ async def handle_archive(event) -> None:
         for filename in filenames:
             fp = os.path.join(root, filename)
 
-            # Skip files > 2GB
             if os.path.getsize(fp) > 2_000_000_000:
                 logger.info(f"Skipping {filename} (>2GB)")
                 continue
 
-            # SUPER MIME FIX – SOLVES PDF ERROR + ALL WEIRD FILES
             guessed_mime = mimetypes.guess_type(fp)[0]
             lower_name = filename.lower()
 
@@ -416,10 +364,14 @@ async def handle_archive(event) -> None:
     if media_group:
         await client.send_file(event.chat_id, media_group)
 
+    # Modified completion message with archive name
     await status.edit(
-        f"✅ **Done!** {len(files)} files uploaded\nThanks for using @{DEVELOPER}'s bot ❤️"
+        f"✅ **Extraction Complete!**\n\n"
+        f"📦 **Archive:** `{archive_name}`\n"
+        f"📁 **Files Extracted:** {len(files)}\n\n"
+        f"Thanks for using @{DEVELOPER}'s bot ❤️"
     )
-    logger.info(f"User {user_id} finished - {len(files)} files")
+    logger.info(f"User {user_id} finished - {len(files)} files from {archive_name}")
 
     shutil.rmtree(extract_to, ignore_errors=True)
     os.remove(path)
@@ -427,9 +379,138 @@ async def handle_archive(event) -> None:
     active_uploads.pop(user_id, None)
 
 
+# ============================= COMMANDS & BUTTONS =============================
+@client.on(events.NewMessage(pattern="/start"))
+async def start(e) -> None:
+    uptime = str(datetime.now() - start_time).split(".")[0]
+    await e.reply(
+        f"**✨ Premium Unzip Bot**\n**@{DEVELOPER}**\n\n"
+        f"🟢 **Uptime:** `{uptime}`\n\n"
+        "Send any archive (ZIP • RAR • 7Z)\n"
+        "Support password protected files\n"
+        "Support All files(pdf, csv, xml, etc)\n"
+        "•Mixed albums\n"
+        "•**Queue system: 1 zip at a time**\n\n"
+        "Ready!",
+        buttons=[
+            [
+                Button.inline("📊 Status", b"status"),
+                Button.inline("ℹ️ Help", b"help"),
+                Button.inline("⏱ Uptime", b"uptime"),
+            ],
+            [Button.url("Developer", f"https://t.me/{DEVELOPER}")],
+        ],
+    )
+
+
+@client.on(events.CallbackQuery(data=b"status"))
+async def cb_status(e) -> None:
+    if not is_processing and task_queue.empty():
+        await e.answer("✅ No active tasks", alert=True)
+    else:
+        queue_size = task_queue.qsize()
+        msg = f"⚙️ Processing: User {current_user}\n📋 In queue: {queue_size}"
+        await e.answer(msg, alert=True)
+
+
+@client.on(events.CallbackQuery(data=b"help"))
+async def cb_help(e) -> None:
+    await e.reply(
+        "**Help**\n• Send archive\n• Password: `/pass abc123`\n• Cancel anytime\n"
+        "• **Queue: Files processed one at a time**\n\n"
+        "Supported: ZIP RAR 7Z TAR\nMade by @hellopeter3"
+    )
+
+
+@client.on(events.CallbackQuery(data=b"uptime"))
+async def cb_uptime(e) -> None:
+    await e.answer(str(datetime.now() - start_time).split(".")[0], alert=True)
+
+
+@client.on(events.CallbackQuery(data=b"cancel"))
+async def cancel(e) -> None:
+    if e.sender_id in pending_tasks:
+        pending_tasks[e.sender_id] = True
+        await e.answer("Cancelled!", alert=True)
+
+
+# Text commands
+@client.on(events.NewMessage(pattern="/status"))
+async def cmd_status(e) -> None:
+    if not is_processing and task_queue.empty():
+        await e.reply("✅ **No active tasks**")
+    else:
+        queue_size = task_queue.qsize()
+        msg = f"⚙️ **Currently processing**\n📋 **Queue:** {queue_size} waiting"
+        if e.sender_id in [q["user_id"] for q in queue_list]:
+            pos = [i for i, q in enumerate(queue_list) if q["user_id"] == e.sender_id][0]
+            msg += f"\n\n**Your position:** {pos + 1}"
+        await e.reply(msg)
+
+
+@client.on(events.NewMessage(pattern="/uptime"))
+async def cmd_uptime(e) -> None:
+    await e.reply(f"⏱ **Uptime:** {str(datetime.now() - start_time).split('.')[0]}")
+
+
+@client.on(events.NewMessage(pattern="/pass"))
+async def set_pass(e) -> None:
+    parts = e.text.split()
+    if len(parts) < 2:
+        await e.reply("Usage: `/pass your_password`")
+        return
+    user_passwords[e.sender_id] = " ".join(parts[1:]).encode()
+    await e.reply("✅ Password saved! Resend the file.")
+    logger.info(f"Password set by {e.sender_id}")
+
+
+# ============================= MAIN HANDLER (Queue Entry) =============================
+@client.on(
+    events.NewMessage(
+        func=lambda e: e.file
+        and e.file.name
+        and e.file.name.lower().endswith(
+            (".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2")
+        )
+    )
+)
+async def handle_archive(event) -> None:
+    user_id = event.sender_id
+    
+    # Check if user already in queue
+    if any(q["user_id"] == user_id for q in queue_list):
+        await event.reply("⚠️ You already have a file in queue! Please wait.")
+        return
+    
+    queue_position = task_queue.qsize() + 1
+    
+    if queue_position == 1:
+        status = await event.reply("🚀 **Starting immediately...**")
+    else:
+        status = await event.reply(
+            f"📥 **Added to queue**\n**Position:** {queue_position}\n\n"
+            f"Processing 1 file at a time. Please wait..."
+        )
+    
+    task_data = {
+        "event": event,
+        "status": status,
+        "user_id": user_id,
+    }
+    
+    queue_list.append(task_data)
+    await task_queue.put(task_data)
+    logger.info(f"User {user_id} added to queue (position: {queue_position})")
+
+
 # ============================= START =============================
 async def main() -> None:
     await client.start(bot_token=BOT_TOKEN)
+    
+    # Start queue worker
+    asyncio.create_task(queue_worker())
+    logger.info(f"{c.C}Queue worker started{c.E}")
+    
     print(f"{c.G}BOT BY @{DEVELOPER} IS 100% READY & ONLINE!{c.E}")
     await client.run_until_disconnected()
 

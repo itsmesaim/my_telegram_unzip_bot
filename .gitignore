@@ -11,6 +11,7 @@ __pycache__/
 session_save.txt
 *.session
 *.session-journal
+replacements.txt
 
 # Downloaded & extracted files (VERY IMPORTANT)
 downloads/
@@ -40,6 +41,7 @@ desktop.ini
 *.tmp
 *.temp
 *.bak
+
 
 # FastTelethon temp files
 *.part

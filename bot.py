@@ -7,18 +7,13 @@ import os
 import shutil
 import subprocess
 from datetime import datetime
-from collections import deque
-from typing import Dict, List
-
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeVideo, InputMediaUploadedDocument
-
 from FastTelethonhelper import fast_download, fast_upload
 
 load_dotenv()
-
 # ============================= LOGS =============================
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
@@ -52,22 +47,18 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEVELOPER = "hellopeter3"
 start_time = datetime.now()
-
 client = TelegramClient(
     StringSession(os.getenv("SESSION_STRING", "")), API_ID, API_HASH
 )
-
 # ============================= GLOBALS =============================
-user_passwords: Dict[int, bytes] = {}
-pending_tasks: Dict[int, bool] = {}
-active_uploads: Dict[int, int] = {}
-
-# ============================= SIMPLE QUEUE SYSTEM =============================
-# Per-user queues
-user_queues: Dict[int, deque] = {}
-
-# Track active tasks per user
-user_active_tasks: Dict[int, asyncio.Task] = {}
+user_passwords: dict[int, bytes] = {}
+pending_tasks: dict[int, bool] = {}
+active_uploads: dict[int, int] = {}
+# ============================= QUEUE SYSTEM =============================
+task_queue = asyncio.Queue()
+queue_list = []  # Track queue for status display
+is_processing = False
+current_user = None
 
 
 # ============================= MUTED VIDEO FIX =============================
@@ -95,7 +86,7 @@ def video_has_audio(path: str) -> bool:
         return True
 
 
-def add_silent_audio(path: str, muted_list: List[str]) -> None:
+def add_silent_audio(path: str, muted_list: list[str]) -> None:
     name = os.path.basename(path)
     if video_has_audio(path):
         logger.info(f"{c.G}Audio preserved → {name}{c.E}")
@@ -139,7 +130,6 @@ def extract_archive(
         logger.info(
             f"Extracting {os.path.basename(file_path)} → {ext} (pwd: {'Yes' if password else 'No'})"
         )
-
         if ext == ".zip":
             with AESZipFile(file_path) if password else zipfile.ZipFile(file_path) as z:
                 z.extractall(extract_to, pwd=password)
@@ -168,209 +158,215 @@ def extract_archive(
 
 # ============================= PROGRESS =============================
 async def update_progress(
-    msg, cur: int, total: int, action: str = "Processing", zip_name: str = ""
+    msg, cur: int, total: int, action: str = "Processing"
 ) -> None:
     try:
         bar = "█" * int(20 * cur / total) + "░" * (20 - int(20 * cur / total))
         perc = cur / total * 100
-        title = f"{action} ({zip_name})" if zip_name else action
         await msg.edit(
-            f"**{title}**\n\n`{bar}` {perc:.1f}%\n{cur:,} / {total:,} files",
+            f"**{action}**\n\n`{bar}` {perc:.1f}%\n{cur:,} / {total:,} files",
             buttons=[[Button.inline("❌ Cancel", b"cancel")]],
         )
     except Exception:
         pass
 
 
-# ============================= PROCESS ARCHIVE =============================
+# ============================= QUEUE WORKER =============================
+async def queue_worker():
+    """Process one task at a time from the queue"""
+    global is_processing, current_user
+
+    while True:
+        task_data = await task_queue.get()
+        is_processing = True
+        current_user = task_data["user_id"]
+
+        try:
+            await process_archive(task_data)
+        except Exception as e:
+            logger.error(f"Queue worker error: {e}")
+            try:
+                await task_data["status"].edit(f"❌ Error: {str(e)}")
+            except:
+                pass
+        finally:
+            # Remove from queue list
+            queue_list[:] = [
+                q for q in queue_list if q["user_id"] != task_data["user_id"]
+            ]
+            is_processing = False
+            current_user = None
+            task_queue.task_done()
+
+
+# ============================= PROCESS ARCHIVE (Main Logic) =============================
 async def process_archive(task_data):
-    """Process a single ZIP for a user"""
+    """Main processing function - extracted from handle_archive"""
     event = task_data["event"]
     status = task_data["status"]
     user_id = task_data["user_id"]
-    zip_name = task_data["zip_name"]
 
     pending_tasks[user_id] = False
     active_uploads[user_id] = 0
-
+    # Store archive name for final message
+    archive_name = event.file.name
     muted_videos = []  # Collect muted fixes for final message
-
+    await status.edit(
+        "⬇️ **Downloading...**", buttons=[[Button.inline("❌ Cancel", b"cancel")]]
+    )
+    path = f"downloads/{event.file.name}"
+    os.makedirs("downloads", exist_ok=True)
     try:
-        # Download
-        await status.edit(
-            "⬇️ **Downloading...**", buttons=[[Button.inline("❌ Cancel", b"cancel")]]
-        )
-        path = f"downloads/{zip_name}"
-        os.makedirs("downloads", exist_ok=True)
-
         await fast_download(
             client,
             event.message,
             path,
             progress_bar_function=lambda c, t: asyncio.create_task(
-                update_progress(status, c, t, "Downloading", zip_name)
+                update_progress(status, c, t, "Downloading")
             ),
         )
-
-        # Extract
-        extract_to = path + "_extracted"
-        os.makedirs(extract_to, exist_ok=True)
-        await status.edit(
-            "🔓 **Extracting...**", buttons=[[Button.inline("❌ Cancel", b"cancel")]]
-        )
-
-        result = extract_archive(path, extract_to, user_passwords.get(user_id))
-
-        if result == "password_required":
-            await status.edit("🔒 **Password required!**\nSend `/pass your_password`")
-            user_passwords.pop(user_id, None)
-            return
-        if result != "success":
-            await status.edit(f"❌ Failed: {result}")
-            shutil.rmtree(extract_to, ignore_errors=True)
-            os.remove(path)
-            return
-
-        # Scan files with mime fix
-        files = []
-        for root, _, filenames in os.walk(extract_to):
-            for filename in filenames:
-                fp = os.path.join(root, filename)
-
-                if os.path.getsize(fp) > 2_000_000_000:
-                    logger.info(f"Skipping {filename} (>2GB)")
-                    continue
-
-                guessed_mime = mimetypes.guess_type(fp)[0]
-                lower_name = filename.lower()
-
-                if guessed_mime is None or guessed_mime == "application/octet-stream":
-                    if lower_name.endswith(".pdf"):
-                        mime = "application/pdf"
-                    elif lower_name.endswith((".doc", ".docx")):
-                        mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    elif lower_name.endswith((".xls", ".xlsx")):
-                        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    elif lower_name.endswith((".ppt", ".pptx")):
-                        mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                    elif lower_name.endswith((".txt", ".log", ".csv", ".md")):
-                        mime = "text/plain"
-                    elif lower_name.endswith((".html", ".htm")):
-                        mime = "text/html"
-                    elif lower_name.endswith(".epub"):
-                        mime = "application/epub+zip"
-                    else:
-                        mime = "application/octet-stream"
-                else:
-                    mime = guessed_mime
-
-                files.append({"path": fp, "name": filename, "mime": mime})
-
-        if not files:
-            await status.edit("No files found")
-            shutil.rmtree(extract_to, ignore_errors=True)
-            os.remove(path)
-            return
-
-        active_uploads[user_id] = len(files)
-        await status.edit(
-            f"📤 **Uploading {len(files)} files from `{zip_name}`...**",
-            buttons=[[Button.inline("❌ Cancel", b"cancel")]],
-        )
-
-        # Send ZIP header
-        await event.reply(f"📦 **Files from `{zip_name}`:**")
-
-        sent = 0
-        media_group = []
-
-        for file in files:
-            if pending_tasks.get(user_id):
-                await status.edit("🛑 Cancelled")
-                break
-
-            if file["mime"].startswith("video/"):
-                add_silent_audio(file["path"], muted_videos)  # Collect, no notify
-
-            uploaded = await fast_upload(client, file["path"])
-            sent += 1
-            active_uploads[user_id] = len(files) - sent
-            await update_progress(status, sent, len(files), "Uploading", zip_name)
-
-            caption = f"From `{zip_name}`: {file['name']}"
-
-            if file["mime"].startswith(("image/", "video/")):
-                if file["mime"].startswith("video/"):
-                    meta = json.loads(
-                        subprocess.run(
-                            [
-                                "ffprobe",
-                                "-v",
-                                "error",
-                                "-show_entries",
-                                "stream=width,height,duration",
-                                "-of",
-                                "json",
-                                file["path"],
-                            ],
-                            capture_output=True,
-                            text=True,
-                        ).stdout
-                    )["streams"][0]
-                    media_group.append(
-                        InputMediaUploadedDocument(
-                            file=uploaded,
-                            mime_type=file["mime"],
-                            attributes=[
-                                DocumentAttributeVideo(
-                                    duration=int(float(meta.get("duration", 0))),
-                                    w=int(meta.get("width", 0)),
-                                    h=int(meta.get("height", 0)),
-                                    supports_streaming=True,
-                                )
-                            ],
-                        )
-                    )
-                else:
-                    media_group.append(uploaded)
-            else:
-                await client.send_file(event.chat_id, uploaded, caption=caption)
-
-            if len(media_group) == 10:
-                await client.send_file(event.chat_id, media_group)
-                media_group = []
-
-        if media_group:
-            await client.send_file(event.chat_id, media_group)
-
-        # Send FINAL completion message (separate from status)
-        final_msg = f"✅ **Upload Complete for `{zip_name}`!**\n\n"
-        final_msg += f"📁 **Files Processed:** {len(files)}\n"
-        if muted_videos:
-            final_msg += f"🔇 **Silent Videos Protected:** {len(muted_videos)} (added silent track to prevent GIF conversion)\n"
-            final_msg += "**Protected:** " + ", ".join(muted_videos) + "\n"
-        final_msg += f"🎉 Thanks for using @{DEVELOPER}'s bot! ❤️"
-
-        await event.reply(final_msg)
-
-        # Keep status as progress reference
-        await status.edit(f"✅ **Completed `{zip_name}`** (see above)")
-
-        logger.info(
-            f"User {user_id} finished `{zip_name}` - {len(files)} files, {len(muted_videos)} muted fixed"
-        )
-
-    except Exception as e:
-        logger.error(f"Process error for {zip_name}: {e}")
-        await status.edit(f"❌ Error: {str(e)}")
-    finally:
+    except:
+        await status.edit("Download cancelled/failed")
+        return
+    extract_to = path + "_extracted"
+    os.makedirs(extract_to, exist_ok=True)
+    await status.edit(
+        "🔓 **Extracting...**", buttons=[[Button.inline("❌ Cancel", b"cancel")]]
+    )
+    result = extract_archive(path, extract_to, user_passwords.get(user_id))
+    if result == "password_required":
+        await status.edit("🔒 **Password required!**\nSend `/pass your_password`")
+        user_passwords.pop(user_id, None)
+        return
+    if result != "success":
+        await status.edit(f"❌ Failed: {result}")
         shutil.rmtree(extract_to, ignore_errors=True)
         if os.path.exists(path):
             os.remove(path)
-        pending_tasks.pop(user_id, None)
-        active_uploads.pop(user_id, None)
-        if user_active_tasks.get(user_id):
-            user_active_tasks[user_id].cancel()
+        return
+    files = []
+    images_count = 0
+    videos_count = 0
+    for root, _, filenames in os.walk(extract_to):
+        for filename in filenames:
+            fp = os.path.join(root, filename)
+            if os.path.getsize(fp) > 2_000_000_000:
+                logger.info(f"Skipping {filename} (>2GB)")
+                continue
+            guessed_mime = mimetypes.guess_type(fp)[0]
+            lower_name = filename.lower()
+            if guessed_mime is None or guessed_mime == "application/octet-stream":
+                if lower_name.endswith(".pdf"):
+                    mime = "application/pdf"
+                elif lower_name.endswith((".doc", ".docx")):
+                    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                elif lower_name.endswith((".xls", ".xlsx")):
+                    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                elif lower_name.endswith((".ppt", ".pptx")):
+                    mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                elif lower_name.endswith((".txt", ".log", ".csv", ".md")):
+                    mime = "text/plain"
+                elif lower_name.endswith((".html", ".htm")):
+                    mime = "text/html"
+                elif lower_name.endswith(".epub"):
+                    mime = "application/epub+zip"
+                else:
+                    mime = "application/octet-stream"
+            else:
+                mime = guessed_mime
+            files.append({"path": fp, "name": filename, "mime": mime})
+
+            # Count images and videos
+            if mime.startswith("image/"):
+                images_count += 1
+            elif mime.startswith("video/"):
+                videos_count += 1
+    if not files:
+        await status.edit("No files found")
+        shutil.rmtree(extract_to, ignore_errors=True)
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    active_uploads[user_id] = len(files)
+    await status.edit(
+        f"📤 **Uploading {len(files)} files...**",
+        buttons=[[Button.inline("❌ Cancel", b"cancel")]],
+    )
+    sent = 0
+    media_group = []
+    # Send header for this ZIP
+    await event.reply(f"📦 **Files from `{archive_name}`:**")
+    for file in files:
+        if pending_tasks.get(user_id):
+            await status.edit("🛑 Cancelled")
+            break
+        if file["mime"].startswith("video/"):
+            add_silent_audio(file["path"], muted_videos)  # Collect, no notify
+        uploaded = await fast_upload(client, file["path"])
+        sent += 1
+        active_uploads[user_id] = len(files) - sent
+        await update_progress(status, sent, len(files), "Uploading")
+        # Add ZIP name to captions for documents/non-media
+        caption = f"From `{archive_name}`: {file['name']}"
+        if file["mime"].startswith(("image/", "video/")):
+            if file["mime"].startswith("video/"):
+                meta = json.loads(
+                    subprocess.run(
+                        [
+                            "ffprobe",
+                            "-v",
+                            "error",
+                            "-show_entries",
+                            "stream=width,height,duration",
+                            "-of",
+                            "json",
+                            file["path"],
+                        ],
+                        capture_output=True,
+                        text=True,
+                    ).stdout
+                )["streams"][0]
+                media_group.append(
+                    InputMediaUploadedDocument(
+                        file=uploaded,
+                        mime_type=file["mime"],
+                        attributes=[
+                            DocumentAttributeVideo(
+                                duration=int(float(meta.get("duration", 0))),
+                                w=int(meta.get("width", 0)),
+                                h=int(meta.get("height", 0)),
+                                supports_streaming=True,
+                            )
+                        ],
+                    )
+                )
+            else:
+                media_group.append(uploaded)
+        else:
+            await client.send_file(event.chat_id, uploaded, caption=caption)
+        if len(media_group) == 10:
+            await client.send_file(event.chat_id, media_group)
+            media_group = []
+    if media_group:
+        await client.send_file(event.chat_id, media_group)
+    # Completion message with archive name and counts
+    final_msg = f"✅ **Upload Complete for `{archive_name}`!**\n\n"
+    final_msg += f"📁 **Total Files Processed:** {len(files)}\n"
+    final_msg += f"🖼️ **Images:** {images_count}\n"
+    final_msg += f"🎥 **Videos:** {videos_count}\n"
+    if muted_videos:
+        final_msg += f"🔇 **Silent Videos Protected:** {len(muted_videos)} (added silent track to prevent GIF conversion)\n"
+        final_msg += "**Protected:** " + ", ".join(muted_videos) + "\n"
+    final_msg += f"🎉 Thanks for using @{DEVELOPER}'s bot! ❤️"
+    await status.edit(final_msg)
+    logger.info(
+        f"User {user_id} finished - {len(files)} files from {archive_name} (images: {images_count}, videos: {videos_count}, muted fixed: {len(muted_videos)})"
+    )
+    shutil.rmtree(extract_to, ignore_errors=True)
+    if os.path.exists(path):
+        os.remove(path)
+    pending_tasks.pop(user_id, None)
+    active_uploads.pop(user_id, None)
 
 
 # ============================= COMMANDS & BUTTONS =============================
@@ -380,12 +376,12 @@ async def start(e) -> None:
     await e.reply(
         f"**✨ Premium Unzip Bot**\n**@{DEVELOPER}**\n\n"
         f"🟢 **Uptime:** `{uptime}`\n\n"
-        "Send any archive (ZIP • RAR • 7Z • TAR)\n"
-        "• Password protected supported\n"
-        "• Muted videos auto-fixed\n"
-        "• Mixed albums (photo + video)\n"
-        "• **Per-user queue** (1 ZIP at a time per user)\n\n"
-        "Ready! 🚀",
+        "Send any archive (ZIP • RAR • 7Z)\n"
+        "Support password protected files\n"
+        "Support All files(pdf, csv, xml, etc)\n"
+        "•Mixed albums\n"
+        "•**Queue system: 1 zip at a time**\n\n"
+        "Ready!",
         buttons=[
             [
                 Button.inline("📊 Status", b"status"),
@@ -399,61 +395,49 @@ async def start(e) -> None:
 
 @client.on(events.CallbackQuery(data=b"status"))
 async def cb_status(e) -> None:
-    user_id = e.sender_id
-    queue_pos = len(user_queues[user_id]) if user_id in user_queues else 0
-    active = active_uploads.get(user_id, 0)
-    msg = f"👤 **Your Status:**\n"
-    if active > 0:
-        msg += f"📤 Active: {active} files\n"
-    if queue_pos > 0:
-        msg += f"⏳ Queued ZIPs: {queue_pos}\n"
-    await e.answer(msg, alert=True)
+    if not is_processing and task_queue.empty():
+        await e.answer("✅ No active tasks", alert=True)
+    else:
+        queue_size = task_queue.qsize()
+        msg = f"⚙️ Processing: User {current_user}\n📋 In queue: {queue_size}"
+        await e.answer(msg, alert=True)
 
 
 @client.on(events.CallbackQuery(data=b"help"))
 async def cb_help(e) -> None:
     await e.reply(
-        "**Help Menu**\n\n"
-        "• Send ZIP/RAR/7Z/TAR file\n"
-        "• Password: `/pass abc123` then resend\n"
-        "• Queue: 1 ZIP per user at a time\n"
-        "• Cancel: Stops your current ZIP\n"
-        "• Muted videos fixed automatically\n\n"
-        "Supported: All files (PDF, DOC, videos, etc.)\n"
-        "Made by @hellopeter3 ❤️"
+        "**Help**\n• Send archive\n• Password: `/pass abc123`\n• Cancel anytime\n"
+        "• **Queue: Files processed one at a time**\n\n"
+        "Supported: ZIP RAR 7Z TAR\nMade by @hellopeter3"
     )
 
 
 @client.on(events.CallbackQuery(data=b"uptime"))
 async def cb_uptime(e) -> None:
-    await e.answer(
-        f"Uptime: {str(datetime.now() - start_time).split('.')[0]}", alert=True
-    )
+    await e.answer(str(datetime.now() - start_time).split(".")[0], alert=True)
 
 
 @client.on(events.CallbackQuery(data=b"cancel"))
 async def cancel(e) -> None:
-    user_id = e.sender_id
-    if user_id in pending_tasks:
-        pending_tasks[user_id] = True
-        await e.answer("Cancelled your active ZIP!", alert=True)
-    if user_id in user_queues and user_queues[user_id]:
-        user_queues[user_id].popleft()
-        await e.answer("Removed your next ZIP from queue!", alert=True)
-    logger.info(f"User {user_id} cancelled task")
+    if e.sender_id in pending_tasks:
+        pending_tasks[e.sender_id] = True
+        await e.answer("Cancelled!", alert=True)
 
 
+# Text commands
 @client.on(events.NewMessage(pattern="/status"))
 async def cmd_status(e) -> None:
-    user_id = e.sender_id
-    queue_pos = len(user_queues[user_id]) if user_id in user_queues else 0
-    active = active_uploads.get(user_id, 0)
-    msg = f"👤 **Your Status:**\n"
-    if active > 0:
-        msg += f"📤 Active ZIP: {active} files\n"
-    if queue_pos > 0:
-        msg += f"⏳ Queued ZIPs: {queue_pos}\n"
-    await e.reply(msg)
+    if not is_processing and task_queue.empty():
+        await e.reply("✅ **No active tasks**")
+    else:
+        queue_size = task_queue.qsize()
+        msg = f"⚙️ **Currently processing**\n📋 **Queue:** {queue_size} waiting"
+        if e.sender_id in [q["user_id"] for q in queue_list]:
+            pos = [i for i, q in enumerate(queue_list) if q["user_id"] == e.sender_id][
+                0
+            ]
+            msg += f"\n\n**Your position:** {pos + 1}"
+        await e.reply(msg)
 
 
 @client.on(events.NewMessage(pattern="/uptime"))
@@ -472,7 +456,7 @@ async def set_pass(e) -> None:
     logger.info(f"Password set by {e.sender_id}")
 
 
-# ============================= MAIN HANDLER =============================
+# ============================= MAIN HANDLER (Queue Entry) =============================
 @client.on(
     events.NewMessage(
         func=lambda e: e.file
@@ -484,50 +468,40 @@ async def set_pass(e) -> None:
 )
 async def handle_archive(event) -> None:
     user_id = event.sender_id
-    zip_name = event.file.name
 
-    # Check if user has active task
-    if user_id in user_active_tasks and not user_active_tasks[user_id].done():
-        await event.reply("⚠️ You already have an active ZIP! Wait or cancel it.")
+    # Check if user already in queue
+    if any(q["user_id"] == user_id for q in queue_list):
+        await event.reply("⚠️ You already have a file in queue! Please wait.")
         return
 
-    # Add to per-user queue
+    queue_position = task_queue.qsize() + 1
+
+    if queue_position == 1:
+        status = await event.reply("🚀 **Starting immediately...**")
+    else:
+        status = await event.reply(
+            f"📥 **Added to queue**\n**Position:** {queue_position}\n\n"
+            f"Processing 1 file at a time. Please wait..."
+        )
+
     task_data = {
         "event": event,
-        "status": None,  # Will be set after
+        "status": status,
         "user_id": user_id,
-        "zip_name": zip_name,
     }
-    if user_id not in user_queues:
-        user_queues[user_id] = deque()
-    user_queues[user_id].append(task_data)
 
-    # Start processing if no active task for this user
-    if len(user_queues[user_id]) == 1 and user_id not in user_active_tasks:
-        # Create status message
-        status = await event.reply("🚀 **Starting your ZIP...**")
-        task_data["status"] = status
-
-        # Start the task
-        task = asyncio.create_task(process_archive(task_data))
-        user_active_tasks[user_id] = task
-        task.add_done_callback(lambda t: user_active_tasks.pop(user_id, None))
-
-    else:
-        # Already queued, inform position
-        pos = len(user_queues[user_id])
-        await event.reply(f"📥 **Added to your queue** (Position {pos})")
-
-    logger.info(
-        f"User {user_id} queued `{zip_name}` (user queue len: {len(user_queues[user_id])})"
-    )
+    queue_list.append(task_data)
+    await task_queue.put(task_data)
+    logger.info(f"User {user_id} added to queue (position: {queue_position})")
 
 
 # ============================= START =============================
 async def main() -> None:
     await client.start(bot_token=BOT_TOKEN)
 
-    logger.info(f"{c.C}Simple queue started (1 ZIP per user){c.E}")
+    # Start queue worker
+    asyncio.create_task(queue_worker())
+    logger.info(f"{c.C}Queue worker started{c.E}")
 
     print(f"{c.G}BOT BY @{DEVELOPER} IS 100% READY & ONLINE!{c.E}")
     await client.run_until_disconnected()

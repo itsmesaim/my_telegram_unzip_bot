@@ -37,7 +37,7 @@ A powerful Telegram bot that extracts and uploads files from compressed archives
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/yourusername/Telegram-Unzip-Bot.git
+git clone https://github.com/itsmesaim/my_telegram_unzip_bot
 cd Telegram-Unzip-Bot
 ```
 
@@ -323,7 +323,7 @@ Created with ❤️ by [@hellopeter3](https://t.me/hellopeter3)
 ## 📞 Support
 
 - **Telegram**: [@hellopeter3](https://t.me/hellopeter3)
-- **Issues**: [GitHub Issues](https://github.com/yourusername/Telegram-Unzip-Bot/issues)
+- **Issues**: [GitHub Issues](https://github.com/itsmesaim/my_telegram_unzip_bot/issues)
 
 ## ⭐ Show Your Support
 

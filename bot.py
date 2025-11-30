@@ -6,6 +6,7 @@ import mimetypes
 import os
 import shutil
 import subprocess
+import re  # For manual pattern matching in callbacks
 from datetime import datetime
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events
@@ -54,11 +55,24 @@ client = TelegramClient(
 user_passwords: dict[int, bytes] = {}
 pending_tasks: dict[int, bool] = {}
 active_uploads: dict[int, int] = {}
+user_in_queue: set[int] = set()  # Fast check for users in queue (prevents multi-add)
+cancelled_users: set[int] = set()  # Renamed for clarity
+user_task_data: dict[int, dict] = {}  # Store task reference per user
+# cancelled_tasks: set[int] = set()  # Track cancelled task IDs to skip in queue
+
+
+# ============================= HELPER: Check if Cancelled =============================
+def is_cancelled(user_id: int) -> bool:
+    """Unified cancel check - use this everywhere"""
+    return pending_tasks.get(user_id, False) or user_id in cancelled_users
+
+
 # ============================= QUEUE SYSTEM =============================
 task_queue = asyncio.Queue()
 queue_list = []  # Track queue for status display
 is_processing = False
 current_user = None
+current_archive = None  # Track current processing archive name
 
 
 # ============================= MUTED VIDEO FIX =============================
@@ -158,9 +172,14 @@ def extract_archive(
 
 # ============================= PROGRESS =============================
 async def update_progress(
-    msg, cur: int, total: int, action: str = "Processing"
+    msg, cur: int, total: int, action: str = "Processing", user_id: int = None
 ) -> None:
+    """Progress updater with cancel check"""
     try:
+        # Check cancel during progress updates
+        if user_id and is_cancelled(user_id):
+            return  # Stop updating if cancelled
+
         bar = "█" * int(20 * cur / total) + "░" * (20 - int(20 * cur / total))
         perc = cur / total * 100
         await msg.edit(
@@ -174,12 +193,28 @@ async def update_progress(
 # ============================= QUEUE WORKER =============================
 async def queue_worker():
     """Process one task at a time from the queue"""
-    global is_processing, current_user
+    global is_processing, current_user, current_archive, user_in_queue, cancelled_users
 
     while True:
         task_data = await task_queue.get()
+        user_id = task_data["user_id"]
+
+        # Check cancelled_users set before starting
+        if user_id in cancelled_users:
+            logger.info(f"Skipping cancelled task for user {user_id}")
+            queue_list[:] = [q for q in queue_list if q["user_id"] != user_id]
+            cancelled_users.discard(user_id)
+            task_queue.task_done()
+            user_in_queue.discard(user_id)
+            continue
+
         is_processing = True
-        current_user = task_data["user_id"]
+        current_user = user_id
+        current_archive = task_data["event"].file.name
+        user_in_queue.discard(user_id)
+
+        # Store task reference
+        user_task_data[user_id] = task_data
 
         try:
             await process_archive(task_data)
@@ -190,71 +225,123 @@ async def queue_worker():
             except:
                 pass
         finally:
-            # Remove from queue list
-            queue_list[:] = [
-                q for q in queue_list if q["user_id"] != task_data["user_id"]
-            ]
+            # Cleanup
+            queue_list[:] = [q for q in queue_list if q["user_id"] != user_id]
             is_processing = False
             current_user = None
+            current_archive = None
+            user_task_data.pop(user_id, None)
+            pending_tasks.pop(user_id, None)
             task_queue.task_done()
 
 
 # ============================= PROCESS ARCHIVE (Main Logic) =============================
 async def process_archive(task_data):
-    """Main processing function - extracted from handle_archive"""
+    """Main processing function with comprehensive cancel checks"""
     event = task_data["event"]
     status = task_data["status"]
     user_id = task_data["user_id"]
 
+    # Initialize cancel flag
     pending_tasks[user_id] = False
     active_uploads[user_id] = 0
-    # Store archive name for final message
+
     archive_name = event.file.name
-    muted_videos = []  # Collect muted fixes for final message
+    muted_videos = []
+
+    # === DOWNLOAD PHASE ===
     await status.edit(
         "⬇️ **Downloading...**", buttons=[[Button.inline("❌ Cancel", b"cancel")]]
     )
+
     path = f"downloads/{event.file.name}"
     os.makedirs("downloads", exist_ok=True)
+
+    # Proper async wrapper that FastTelethon can call
+    async def download_progress(current, total):
+        if is_cancelled(user_id):
+            raise asyncio.CancelledError("Download cancelled by user")
+        await update_progress(status, current, total, "Downloading", user_id)
+        return None  # Important: must return None or the progress continues
+
     try:
         await fast_download(
             client,
             event.message,
             path,
-            progress_bar_function=lambda c, t: asyncio.create_task(
-                update_progress(status, c, t, "Downloading")
-            ),
+            progress_bar_function=download_progress,
         )
-    except:
-        await status.edit("Download cancelled/failed")
+    except asyncio.CancelledError:
+        await status.edit("🛑 **Download cancelled!**")
+        if os.path.exists(path):
+            os.remove(path)
         return
+    except Exception as e:
+        await status.edit(f"❌ Download failed: {str(e)}")
+        return
+
+    # Check after download
+    if is_cancelled(user_id):
+        await status.edit("🛑 **Cancelled after download!**")
+        if os.path.exists(path):
+            os.remove(path)
+        return
+
+    # === EXTRACTION PHASE ===
     extract_to = path + "_extracted"
     os.makedirs(extract_to, exist_ok=True)
+
     await status.edit(
         "🔓 **Extracting...**", buttons=[[Button.inline("❌ Cancel", b"cancel")]]
     )
+
+    if is_cancelled(user_id):
+        await status.edit("🛑 **Extraction cancelled!**")
+        shutil.rmtree(extract_to, ignore_errors=True)
+        if os.path.exists(path):
+            os.remove(path)
+        return
+
     result = extract_archive(path, extract_to, user_passwords.get(user_id))
+
     if result == "password_required":
         await status.edit("🔒 **Password required!**\nSend `/pass your_password`")
         user_passwords.pop(user_id, None)
+        shutil.rmtree(extract_to, ignore_errors=True)
+        if os.path.exists(path):
+            os.remove(path)
         return
+
     if result != "success":
         await status.edit(f"❌ Failed: {result}")
         shutil.rmtree(extract_to, ignore_errors=True)
         if os.path.exists(path):
             os.remove(path)
         return
+
+    # Check after extraction
+    if is_cancelled(user_id):
+        await status.edit("🛑 **Cancelled after extraction!**")
+        shutil.rmtree(extract_to, ignore_errors=True)
+        if os.path.exists(path):
+            os.remove(path)
+        return
+
+    # === COLLECT FILES ===
     files = []
     images_count = 0
     videos_count = 0
+
     for root, _, filenames in os.walk(extract_to):
         for filename in filenames:
             fp = os.path.join(root, filename)
             if os.path.getsize(fp) > 2_000_000_000:
                 logger.info(f"Skipping {filename} (>2GB)")
                 continue
+
             guessed_mime = mimetypes.guess_type(fp)[0]
             lower_name = filename.lower()
+
             if guessed_mime is None or guessed_mime == "application/octet-stream":
                 if lower_name.endswith(".pdf"):
                     mime = "application/pdf"
@@ -274,97 +361,170 @@ async def process_archive(task_data):
                     mime = "application/octet-stream"
             else:
                 mime = guessed_mime
+
             files.append({"path": fp, "name": filename, "mime": mime})
 
-            # Count images and videos
             if mime.startswith("image/"):
                 images_count += 1
             elif mime.startswith("video/"):
                 videos_count += 1
+
     if not files:
-        await status.edit("No files found")
+        await status.edit("❌ No files found in archive")
         shutil.rmtree(extract_to, ignore_errors=True)
         if os.path.exists(path):
             os.remove(path)
         return
+
+    # === UPLOAD PHASE ===
     active_uploads[user_id] = len(files)
+
     await status.edit(
         f"📤 **Uploading {len(files)} files...**",
         buttons=[[Button.inline("❌ Cancel", b"cancel")]],
     )
+
+    if is_cancelled(user_id):
+        await status.edit("🛑 **Cancelled before upload!**")
+        shutil.rmtree(extract_to, ignore_errors=True)
+        if os.path.exists(path):
+            os.remove(path)
+        return
+
+    # Send header
+    await event.reply(f"📦 **Files from `{archive_name}`:**")
+
     sent = 0
     media_group = []
-    # Send header for this ZIP
-    await event.reply(f"📦 **Files from `{archive_name}`:**")
+
     for file in files:
-        if pending_tasks.get(user_id):
-            await status.edit("🛑 Cancelled")
+        # CRITICAL: Check cancel before EACH file
+        if is_cancelled(user_id):
+            await status.edit("🛑 **Upload cancelled!**")
+            await event.reply(
+                f"⚠️ **Task cancelled. {sent}/{len(files)} files uploaded.**"
+            )
             break
+
+        # Process video audio
         if file["mime"].startswith("video/"):
-            add_silent_audio(file["path"], muted_videos)  # Collect, no notify
-        uploaded = await fast_upload(client, file["path"])
+            add_silent_audio(file["path"], muted_videos)
+
+        # Use correct fast_upload without progress (FastTelethon doesn't support upload progress)
+        try:
+            uploaded = await fast_upload(client, file["path"])
+        except Exception as e:
+            logger.error(f"Upload error for {file['name']}: {e}")
+            continue
+
         sent += 1
         active_uploads[user_id] = len(files) - sent
-        await update_progress(status, sent, len(files), "Uploading")
-        # Add ZIP name to captions for documents/non-media
+
+        # Update progress manually after each file
+        await update_progress(status, sent, len(files), "Uploading", user_id)
+
+        # Check again before sending
+        if is_cancelled(user_id):
+            await status.edit("🛑 **Send cancelled!**")
+            break
+
         caption = f"From `{archive_name}`: {file['name']}"
+
+        # Send file
         if file["mime"].startswith(("image/", "video/")):
             if file["mime"].startswith("video/"):
-                meta = json.loads(
-                    subprocess.run(
-                        [
-                            "ffprobe",
-                            "-v",
-                            "error",
-                            "-show_entries",
-                            "stream=width,height,duration",
-                            "-of",
-                            "json",
-                            file["path"],
-                        ],
-                        capture_output=True,
-                        text=True,
-                    ).stdout
-                )["streams"][0]
-                media_group.append(
-                    InputMediaUploadedDocument(
-                        file=uploaded,
-                        mime_type=file["mime"],
-                        attributes=[
-                            DocumentAttributeVideo(
-                                duration=int(float(meta.get("duration", 0))),
-                                w=int(meta.get("width", 0)),
-                                h=int(meta.get("height", 0)),
-                                supports_streaming=True,
-                            )
-                        ],
+                try:
+                    meta = json.loads(
+                        subprocess.run(
+                            [
+                                "ffprobe",
+                                "-v",
+                                "error",
+                                "-select_streams",
+                                "v",
+                                "-show_entries",
+                                "stream=width,height,duration",
+                                "-of",
+                                "json",
+                                file["path"],
+                            ],
+                            capture_output=True,
+                            text=True,
+                        ).stdout
+                    )["streams"][0]
+
+                    media_group.append(
+                        InputMediaUploadedDocument(
+                            file=uploaded,
+                            mime_type=file["mime"],
+                            attributes=[
+                                DocumentAttributeVideo(
+                                    duration=int(float(meta.get("duration", 0))),
+                                    w=int(meta.get("width", 0)),
+                                    h=int(meta.get("height", 0)),
+                                    supports_streaming=True,
+                                )
+                            ],
+                        )
                     )
-                )
+                except Exception as e:
+                    logger.error(f"Video metadata error for {file['name']}: {e}")
+                    # Fallback: send as regular file
+                    await client.send_file(event.chat_id, uploaded, caption=caption)
+                    continue
             else:
                 media_group.append(uploaded)
         else:
             await client.send_file(event.chat_id, uploaded, caption=caption)
+
+        # Send media group if full
         if len(media_group) == 10:
-            await client.send_file(event.chat_id, media_group)
+            if is_cancelled(user_id):
+                break
+            try:
+                await client.send_file(event.chat_id, media_group)
+            except Exception as e:
+                logger.error(f"Failed to send media group: {e}")
             media_group = []
-    if media_group:
-        await client.send_file(event.chat_id, media_group)
-    # Completion message with archive name and counts
-    final_msg = f"✅ **Upload Complete for `{archive_name}`!**\n\n"
-    final_msg += f"📁 **Total Files Processed:** {len(files)}\n"
-    final_msg += f"🖼️ **Images:** {images_count}\n"
-    final_msg += f"🎥 **Videos:** {videos_count}\n"
-    if muted_videos:
-        final_msg += f"🔇 **Silent Videos Protected:** {len(muted_videos)} (added silent track to prevent GIF conversion)\n"
-        final_msg += "**Protected:** " + ", ".join(muted_videos) + "\n"
-    final_msg += f"🎉 Thanks for using @{DEVELOPER}'s bot! ❤️"
-    await status.edit(final_msg)
-    logger.info(
-        f"User {user_id} finished - {len(files)} files from {archive_name} (images: {images_count}, videos: {videos_count}, muted fixed: {len(muted_videos)})"
-    )
+
+        # Yield to event loop
+        await asyncio.sleep(0.05)
+
+    # Send remaining media
+    if media_group and not is_cancelled(user_id):
+        try:
+            await client.send_file(event.chat_id, media_group)
+        except Exception as e:
+            logger.error(f"Failed to send remaining media group: {e}")
+
+    # === COMPLETION ===
+    if is_cancelled(user_id):
+        # Already notified above
+        pass
+    else:
+        # Success message
+        final_msg = f"✅ **Upload Complete for `{archive_name}`!**\n\n"
+        final_msg += f"📁 **Total Files:** {len(files)}\n"
+        final_msg += f"🖼️ **Images:** {images_count}\n"
+        final_msg += f"🎥 **Videos:** {videos_count}\n"
+
+        if muted_videos:
+            final_msg += f"🔇 **Silent Videos Fixed:** {len(muted_videos)}\n"
+
+        final_msg += f"\n🎉 Thanks for using @{DEVELOPER}'s bot!"
+
+        await event.reply(final_msg)
+        await status.edit(f"✅ **Completed `{archive_name}`**")
+
+        logger.info(
+            f"User {user_id} completed - {len(files)} files from {archive_name}"
+        )
+
+    # Cleanup
     shutil.rmtree(extract_to, ignore_errors=True)
     if os.path.exists(path):
         os.remove(path)
+
     pending_tasks.pop(user_id, None)
     active_uploads.pop(user_id, None)
 
@@ -395,12 +555,20 @@ async def start(e) -> None:
 
 @client.on(events.CallbackQuery(data=b"status"))
 async def cb_status(e) -> None:
-    if not is_processing and task_queue.empty():
+    user_id = e.sender_id
+    if not is_processing and not queue_list:
         await e.answer("✅ No active tasks", alert=True)
-    else:
-        queue_size = task_queue.qsize()
-        msg = f"⚙️ Processing: User {current_user}\n📋 In queue: {queue_size}"
-        await e.answer(msg, alert=True)
+        return
+    # Build status with positions and filenames
+    status_text = "📊 **Queue Status:**\n\n"
+    if is_processing:
+        status_text += f"🔄 **Processing:** `{current_archive or 'Unknown'}`\n\n"
+    if queue_list:
+        status_text += "**Upcoming:**\n"
+        for i, task in enumerate(queue_list, 1):
+            filename = task["event"].file.name
+            status_text += f"{i}. `{filename}`\n"
+    await e.answer(status_text, alert=True)
 
 
 @client.on(events.CallbackQuery(data=b"help"))
@@ -417,27 +585,177 @@ async def cb_uptime(e) -> None:
     await e.answer(str(datetime.now() - start_time).split(".")[0], alert=True)
 
 
+# Generic CallbackQuery handler + manual re.match for cancel patterns
+@client.on(events.CallbackQuery())
+async def cancel_specific(e) -> None:
+    """Handle specific position cancels"""
+    data_bytes = e.data
+    if not data_bytes or not data_bytes.startswith(b"cancel_"):
+        return
+
+    data = data_bytes.decode()
+    user_id = e.sender_id
+
+    match = re.match(r"cancel_(all|pos_(\d+))", data)
+    if not match:
+        return
+
+    action = match.group(1)
+
+    if action == "all":
+        # Cancel all user's tasks
+        user_tasks = [q for q in queue_list if q["user_id"] == user_id]
+        if not user_tasks:
+            await e.answer("No tasks to cancel.", alert=True)
+            return
+
+        queue_list[:] = [q for q in queue_list if q["user_id"] != user_id]
+        cancelled_users.add(user_id)
+        user_in_queue.discard(user_id)
+
+        await e.answer(f"🗑️ Cancelled {len(user_tasks)} queued task(s)!", alert=True)
+        logger.info(f"User {user_id} cancelled all queued tasks")
+        return
+
+    # Cancel specific position
+    pos = int(match.group(2))
+    if 1 <= pos <= len(queue_list):
+        task = queue_list[pos - 1]
+        if task["user_id"] == user_id:
+            filename = task["event"].file.name
+            del queue_list[pos - 1]
+            cancelled_users.add(user_id)
+            user_in_queue.discard(user_id)
+
+            await e.answer(f"❌ Cancelled: `{filename}`", alert=True)
+            logger.info(f"User {user_id} cancelled position {pos}")
+        else:
+            await e.answer("⚠️ Cannot cancel others' tasks.", alert=True)
+    else:
+        await e.answer("Invalid position.", alert=True)
+
+
 @client.on(events.CallbackQuery(data=b"cancel"))
 async def cancel(e) -> None:
-    if e.sender_id in pending_tasks:
-        pending_tasks[e.sender_id] = True
-        await e.answer("Cancelled!", alert=True)
+    """Handle cancel button in status message"""
+    user_id = e.sender_id
+
+    # Cancel active task
+    if user_id in pending_tasks or user_id == current_user:
+        pending_tasks[user_id] = True
+        await e.answer("🛑 Cancelling current task...", alert=True)
+        logger.info(f"User {user_id} pressed cancel button")
+        return
+
+    # Cancel queued task
+    if user_id in user_in_queue:
+        cancelled_users.add(user_id)
+        queue_list[:] = [q for q in queue_list if q["user_id"] != user_id]
+        user_in_queue.discard(user_id)
+        await e.answer("🛑 Queued task cancelled!", alert=True)
+        logger.info(f"User {user_id} cancelled queued task")
+        return
+
+    await e.answer("No active task to cancel.", alert=False)
 
 
 # Text commands
 @client.on(events.NewMessage(pattern="/status"))
 async def cmd_status(e) -> None:
-    if not is_processing and task_queue.empty():
+    """Show queue status with cancel options"""
+    user_id = e.sender_id
+
+    if not is_processing and not queue_list:
         await e.reply("✅ **No active tasks**")
+        return
+
+    status_text = "📊 **Queue Status:**\n\n"
+    buttons = []
+
+    if is_processing and current_user:
+        status_text += f"🔄 **Processing:** `{current_archive or 'Unknown'}`"
+        if current_user == user_id:
+            status_text += " **(Your task)**"
+            buttons.append([Button.inline("❌ Cancel Current", b"cancel")])
+        status_text += "\n\n"
+
+    if queue_list:
+        status_text += "**Upcoming Queue:**\n"
+        user_positions = []
+
+        for i, task in enumerate(queue_list, 1):
+            filename = task["event"].file.name
+            is_yours = task["user_id"] == user_id
+            marker = "👤 " if is_yours else ""
+            status_text += f"{i}. {marker}`{filename}`\n"
+
+            if is_yours:
+                user_positions.append(i)
+
+        # Add cancel buttons for user's tasks
+        if user_positions:
+            if len(user_positions) == 1:
+                buttons.append(
+                    [
+                        Button.inline(
+                            "❌ Cancel My Task",
+                            f"cancel_pos_{user_positions[0]}".encode(),
+                        )
+                    ]
+                )
+            else:
+                buttons.append([Button.inline("🗑️ Cancel All Mine", b"cancel_all")])
+
+    if buttons:
+        await e.reply(status_text, buttons=buttons)
     else:
-        queue_size = task_queue.qsize()
-        msg = f"⚙️ **Currently processing**\n📋 **Queue:** {queue_size} waiting"
-        if e.sender_id in [q["user_id"] for q in queue_list]:
-            pos = [i for i, q in enumerate(queue_list) if q["user_id"] == e.sender_id][
-                0
-            ]
-            msg += f"\n\n**Your position:** {pos + 1}"
-        await e.reply(msg)
+        await e.reply(status_text)
+
+
+@client.on(events.NewMessage(pattern="/cancel"))
+async def cmd_cancel(e) -> None:
+    """Handle /cancel command"""
+    user_id = e.sender_id
+
+    # Cancel active processing task
+    if user_id in pending_tasks or user_id == current_user:
+        pending_tasks[user_id] = True
+        await e.reply("🛑 **Cancelling current task...**")
+        logger.info(f"User {user_id} used /cancel on active task")
+        return
+
+    # Cancel queued tasks
+    user_tasks = [q for q in queue_list if q["user_id"] == user_id]
+    if not user_tasks:
+        await e.reply("ℹ️ **No tasks to cancel.** Use `/status` to check queue.")
+        return
+
+    if len(user_tasks) == 1:
+        # Cancel single task
+        filename = user_tasks[0]["event"].file.name
+        queue_list[:] = [q for q in queue_list if q["user_id"] != user_id]
+        cancelled_users.add(user_id)
+        user_in_queue.discard(user_id)
+
+        await e.reply(f"❌ **Cancelled:** `{filename}`")
+        logger.info(f"User {user_id} cancelled queued task")
+    else:
+        # Show options for multiple
+        buttons = []
+        for i, task in enumerate(user_tasks, 1):
+            filename = task["event"].file.name
+            buttons.append(
+                [
+                    Button.inline(
+                        f"❌ Cancel: {filename[:30]}", f"cancel_pos_{i}".encode()
+                    )
+                ]
+            )
+        buttons.append([Button.inline("🗑️ Cancel All", b"cancel_all")])
+
+        await e.reply(
+            f"**You have {len(user_tasks)} queued tasks. Choose:**", buttons=buttons
+        )
 
 
 @client.on(events.NewMessage(pattern="/uptime"))
@@ -469,14 +787,16 @@ async def set_pass(e) -> None:
 async def handle_archive(event) -> None:
     user_id = event.sender_id
 
-    # Check if user already in queue
-    if any(q["user_id"] == user_id for q in queue_list):
+    # Use set for fast, atomic check to prevent multi-adds
+    global user_in_queue
+    if user_id in user_in_queue:
         await event.reply("⚠️ You already have a file in queue! Please wait.")
         return
 
-    queue_position = task_queue.qsize() + 1
-
-    if queue_position == 1:
+    queue_position = len(queue_list) + (
+        1 if is_processing else 0
+    )  # Accurate pos with processing
+    if queue_position == 1 and not is_processing:
         status = await event.reply("🚀 **Starting immediately...**")
     else:
         status = await event.reply(
@@ -488,11 +808,15 @@ async def handle_archive(event) -> None:
         "event": event,
         "status": status,
         "user_id": user_id,
+        "cancelled": False,  # Track per-task cancel
     }
 
     queue_list.append(task_data)
+    user_in_queue.add(user_id)  # Mark user as queued
     await task_queue.put(task_data)
-    logger.info(f"User {user_id} added to queue (position: {queue_position})")
+    logger.info(
+        f"User {user_id} added to queue (position: {queue_position}, file: {event.file.name})"
+    )
 
 
 # ============================= START =============================

@@ -38,7 +38,7 @@ A powerful Telegram bot that extracts and uploads files from compressed archives
 ### 1. Clone the Repository
 ```bash
 git clone https://github.com/itsmesaim/my_telegram_unzip_bot
-cd Telegram-Unzip-Bot
+cd my_telegram_unzip_bot
 ```
 
 ### 2. Install FFmpeg
